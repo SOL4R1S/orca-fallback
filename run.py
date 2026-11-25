@@ -42,6 +42,10 @@ PROVIDER_ERRORS = (
     "provider timed out",
     "service unavailable",
     "overloaded_error",
+    "provider error 4",
+    "provider error 5",
+    "model not exist",
+    "model_not_found",
 )
 HUMAN_WAIT_STATES = (
     "waiting",

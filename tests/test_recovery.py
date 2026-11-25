@@ -1042,6 +1042,102 @@ class RecoveryAndDispatchTests(unittest.TestCase):
             ["done"],
         )
 
+    def test_real_orca_automation_envelope_dispatched_and_completed_snapshot(self):
+        # 1) Wrapped {"automation": {...}} envelope with rrule, runContext.path, agentId + extraAgentArgs
+        wrapped_auto = {
+            "automation": {
+                "id": "auto_real_1",
+                "enabled": True,
+                "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                "updatedAt": 1795595328309,
+                "agentId": "codex",
+                "extraAgentArgs": "--model gpt-6-luna",
+                "runContext": {"kind": "workspace-run", "path": str(self.worktree)},
+                "workspaceId": f"repo_1::{self.worktree}",
+                "prompt": "Run nightly check",
+            }
+        }
+        # Dispatched run must block as active_or_uncertain
+        with mock.patch.object(
+            self.fake_orca,
+            "call",
+            side_effect=lambda *a, **kw: wrapped_auto
+            if a[:2] == ("automations", "show")
+            else {"runs": [{"id": "run_live_1", "status": "dispatched"}]},
+        ):
+            blocked = self.supervisor.recover(
+                kind="automation",
+                role="implementation",
+                lane="economy",
+                automation_id="auto_real_1",
+                execute=True,
+            )
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertEqual(blocked["block_reason"], "active_or_uncertain")
+
+        # 2) Completed original run with Codex TUI Provider error 404 in outputSnapshot -> extracted & recoverable
+        failed_snapshot_run = {
+            "id": "run_fail_snap",
+            "status": "completed",
+            "error": None,
+            "outputSnapshot": {
+                "format": "plain_text",
+                "content": "■ unexpected status 404 Not Found: Provider error 404: Model not exist.",
+            },
+        }
+        self.fake_orca.automations["auto_real_1"] = dict(wrapped_auto)
+        self.fake_orca.automation_runs["auto_real_1"] = [failed_snapshot_run]
+        dry = self.supervisor.recover(
+            kind="automation",
+            role="implementation",
+            lane="economy",
+            automation_id="auto_real_1",
+            execute=False,
+        )
+        self.assertEqual(dry["status"], "dry_run_planned")
+        self.assertEqual(dry["worktree"], str(self.worktree))
+        self.assertEqual(dry["actual_provider"], "codex:command-code/z-ai/glm-5.3-flash")
+
+        # 3) Reconcile real Orca completed run with outputSnapshot "OK" -> recovered & clears stale block_reason
+        rec = {
+            "recovery_id": "deadbeef1234",
+            "idempotency_key": "canonical:real:snap",
+            "mode": "execute",
+            "target_kind": "bot_chat",
+            "status": "blocked",
+            "block_reason": "ambiguous_launch_reconcile_required",
+            "role": "implementation",
+            "lane": "economy",
+            "actual_provider": "codex:gpt-6-luna",
+            "original_ids": {"bot": "atlas-orchestrator", "chat_id": "c1"},
+            "recovery_automation_id": "auto_real_1",
+            "recovery_run_id": "run_ok_snap",
+            "verification_evidence": {},
+            "mutations": [],
+            "external_action_receipts": [],
+            "history": [],
+        }
+        self.supervisor._persist(rec, claim_idempotency=True)
+        self.fake_orca.automation_runs["auto_real_1"] = [
+            {
+                "id": "run_ok_snap",
+                "status": "completed",
+                "error": None,
+                "outputSnapshot": {"format": "plain_text", "content": "OK"},
+                "terminalSessionId": "term_sess_1",
+            }
+        ]
+        reconciled = self.supervisor.reconcile("deadbeef1234", execute=True)
+        self.assertEqual(reconciled["status"], "recovered")
+        self.assertNotIn("block_reason", reconciled)
+
+        # 4) Reconcile completed run whose outputSnapshot contains Provider error -> recovery_run_failed
+        rec_fail = dict(rec, recovery_id="deadbeef5678", idempotency_key="canonical:real:snapfail", recovery_run_id="run_fail_snap")
+        self.supervisor._persist(rec_fail, claim_idempotency=True)
+        self.fake_orca.automation_runs["auto_real_1"] = [failed_snapshot_run]
+        reconciled_fail = self.supervisor.reconcile("deadbeef5678", execute=True)
+        self.assertEqual(reconciled_fail["status"], "recovery_run_failed")
+
     def test_load_record_rejects_path_traversal(self):
         outside = self.root / "outside.json"
         outside.write_text(json.dumps({"recovery_id": "outside", "idempotency_key": "k"}), encoding="utf-8")

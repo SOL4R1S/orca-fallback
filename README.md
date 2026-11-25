@@ -96,6 +96,9 @@ python3 ~/orca-fallback/recovery.py recover \
 
 # Reconcile an accepted recovery run against terminal status before marking recovered
 python3 ~/orca-fallback/recovery.py reconcile --recovery-id <id> --execute
+
+# Run the isolated, loopback-only live E2E harness (creates disposable temp ORCA_USER_DATA_PATH)
+python3 ~/orca-fallback/scripts/e2e_isolated.py
 ```
 
 Key safety guarantees:

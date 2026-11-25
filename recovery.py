@@ -26,7 +26,18 @@ import run
 SETTLED_FAILED_RUN_STATES = frozenset({"failed", "error", "errored", "timed_out"})
 TERMINAL_FAILED_RUN_STATES = frozenset({"failed", "error", "errored", "timed_out", "cancelled", "canceled"})
 ACTIVE_RUN_STATES = frozenset(
-    {"running", "active", "queued", "pending", "starting", "started", "accepted", "in_progress", "streaming"}
+    {
+        "running",
+        "active",
+        "queued",
+        "pending",
+        "starting",
+        "started",
+        "accepted",
+        "dispatched",
+        "in_progress",
+        "streaming",
+    }
 )
 RESUMABLE_DELAYED_STATUSES = frozenset({"exhausted_delayed_resume", "probe_failed", "waiting_for_reset"})
 SAFE_BOT_META_KEYS = ("id", "slug", "name", "displayName", "bot", "handle")
@@ -52,6 +63,8 @@ RECEIPT_ALLOWLIST_KEYS = (
 )
 RECOVERY_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 HEALTH_PROBE_PROMPT = "Reply with exact text OK and nothing else."
+EXTRA_MODEL_RE = re.compile(r"(?:--model|-m)(?:\s+|=)([^\s'\"]+)")
+TUI_PROVIDER_ERROR_MARKERS = ("unexpected status", "provider error")
 
 
 def _recovery_settings() -> dict[str, Any]:
@@ -103,6 +116,78 @@ def _provider_key(agent: Any, model: Any) -> str | None:
     if isinstance(agent, str) and agent.strip() and isinstance(model, str) and model.strip():
         return f"{agent.strip()}:{model.strip()}"
     return None
+
+
+def _unwrap_automation(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    inner = payload.get("automation")
+    return inner if isinstance(inner, dict) else payload
+
+
+def _automation_worktree(auto: dict[str, Any]) -> str | None:
+    for candidate in (
+        auto.get("workspace"),
+        auto.get("worktree"),
+        (auto.get("runContext") or {}).get("path") if isinstance(auto.get("runContext"), dict) else None,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    ws_id = auto.get("workspaceId")
+    if isinstance(ws_id, str) and "::" in ws_id:
+        path_part = ws_id.split("::", 1)[1].strip()
+        if path_part:
+            return path_part
+    return None
+
+
+def _automation_provider_key(auto: dict[str, Any]) -> str | None:
+    if isinstance(auto.get("modelKey"), str) and auto["modelKey"].strip():
+        return auto["modelKey"].strip()
+    agent = auto.get("agent") or auto.get("provider") or auto.get("agentId")
+    model = auto.get("model")
+    if not model:
+        extra = auto.get("extraAgentArgs") or (
+            (auto.get("launchSetup") or {}).get("extraAgentArgs")
+            if isinstance(auto.get("launchSetup"), dict)
+            else None
+        )
+        if isinstance(extra, str):
+            match = EXTRA_MODEL_RE.search(extra)
+            if match:
+                model = match.group(1)
+    return _provider_key(agent, model)
+
+
+def _extract_run_text(target_run: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for field in ("error", "output", "excerpt", "summary"):
+        val = target_run.get(field)
+        if isinstance(val, str) and val:
+            parts.append(val)
+    snapshot = target_run.get("outputSnapshot")
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("content"), str) and snapshot["content"]:
+        parts.append(snapshot["content"])
+    return "\n".join(parts)
+
+
+def _run_output_has_provider_failure(target_run: dict[str, Any]) -> bool:
+    snapshot = target_run.get("outputSnapshot")
+    content = snapshot.get("content") if isinstance(snapshot, dict) else None
+    text = "\n".join(
+        val for val in (target_run.get("error"), content) if isinstance(val, str) and val
+    )
+    if not text:
+        return False
+    lowered = text.lower()
+    return run.is_provider_failure(text) or all(m in lowered for m in TUI_PROVIDER_ERROR_MARKERS)
+
+
+def _completed_run_has_evidence(target_run: dict[str, Any]) -> bool:
+    return any(
+        target_run.get(field) is not None
+        for field in ("outputSnapshot", "output", "terminalSessionId", "chatSessionId", "finishedAt", "completedAt")
+    )
 
 
 def _extract_agent_show_states(show: dict[str, Any]) -> list[str]:
@@ -190,13 +275,15 @@ class OrcaRecoveryAdapter:
         return self.orca.call("automations", "list")
 
     def automations_show(self, automation_id: str) -> dict[str, Any]:
-        return self.orca.call("automations", "show", automation_id)
+        return _unwrap_automation(self.orca.call("automations", "show", automation_id))
 
     def automations_runs(self, automation_id: str) -> dict[str, Any]:
         return self.orca.call("automations", "runs", "--id", automation_id, "--limit", "20")
 
     def automations_edit_enabled(self, automation_id: str, enabled: bool) -> dict[str, Any]:
-        return self.orca.call("automations", "edit", automation_id, "--enabled" if enabled else "--disabled")
+        return _unwrap_automation(
+            self.orca.call("automations", "edit", automation_id, "--enabled" if enabled else "--disabled")
+        )
 
     def create_one_time_bot_automation(
         self,
@@ -236,7 +323,7 @@ class OrcaRecoveryAdapter:
             args.extend(["--item", str(item_id)])
         if results_to:
             args.extend(["--results-to", results_to])
-        return self.orca.call(*args)
+        return _unwrap_automation(self.orca.call(*args))
 
     def automations_run(self, automation_id: str) -> dict[str, Any]:
         return self.orca.call("automations", "run", automation_id)
@@ -781,11 +868,7 @@ class RecoverySupervisor:
                 }
             resolved_run_id = str(target_run["id"])
             canonical_key = f"canonical:automation:{automation_id}:{resolved_run_id}"
-            run_text = "\n".join(
-                str(target_run.get(field))
-                for field in ("error", "output", "excerpt", "summary")
-                if target_run.get(field)
-            )
+            run_text = _extract_run_text(target_run)
             if run.is_human_input_wait(target_run, run_text):
                 return {
                     "settled": True,
@@ -797,7 +880,10 @@ class RecoverySupervisor:
                     "canonical_key": canonical_key,
                 }
             run_status = str(target_run.get("status") or target_run.get("state") or "").lower()
-            if run_status not in SETTLED_FAILED_RUN_STATES:
+            completed_failed = run_status == "completed" and (
+                bool(target_run.get("error")) or _run_output_has_provider_failure(target_run)
+            )
+            if run_status not in SETTLED_FAILED_RUN_STATES and not completed_failed:
                 return {
                     "settled": False,
                     "reason": "active_or_uncertain",
@@ -811,8 +897,7 @@ class RecoverySupervisor:
             verified_failed = (
                 target_run.get("modelKey")
                 or _provider_key(target_run.get("agent"), target_run.get("model"))
-                or auto.get("modelKey")
-                or _provider_key(auto.get("agent") or auto.get("provider"), auto.get("model"))
+                or _automation_provider_key(auto)
             )
             return {
                 "settled": True,
@@ -825,7 +910,7 @@ class RecoverySupervisor:
                 "raw_record": auto,
                 "target_run": target_run,
                 "resolved_run_id": resolved_run_id,
-                "worktree": auto.get("workspace") or auto.get("worktree") or (audit or {}).get("worktree"),
+                "worktree": _automation_worktree(auto) or (audit or {}).get("worktree"),
                 "item_id": auto.get("itemId") or auto.get("item"),
                 "canonical_key": canonical_key,
                 "verified_role": auto.get("role") or (audit or {}).get("role"),
@@ -1049,6 +1134,7 @@ class RecoverySupervisor:
             "enabled": False,
             "updatedAt": post_auto.get("updatedAt"),
             "trigger": post_auto.get("trigger"),
+            "rrule": post_auto.get("rrule"),
         }
         self._record_event(record, "original_schedule_disabled", "paused_original")
         self._persist(record, claim_idempotency=True)
@@ -1072,6 +1158,7 @@ class RecoverySupervisor:
             current.get("enabled") is not False
             or (snap.get("updatedAt") is not None and current.get("updatedAt") != snap.get("updatedAt"))
             or (snap.get("trigger") is not None and current.get("trigger") != snap.get("trigger"))
+            or (snap.get("rrule") is not None and current.get("rrule") != snap.get("rrule"))
         )
         if operator_changed:
             record["pause_owned"] = False
@@ -1771,12 +1858,9 @@ class RecoverySupervisor:
             )
             return self._persist(record, claim_idempotency=execute)
 
-        run_text = "\n".join(
-            str(target_run.get(field))
-            for field in ("error", "output", "excerpt", "summary")
-            if target_run.get(field)
-        )
+        run_text = _extract_run_text(target_run)
         if run.is_human_input_wait(target_run, run_text):
+            record.pop("block_reason", None)
             record["verification_evidence"]["recovery_run_classification"] = run.classify_worker_failure(
                 target_run, run_text
             )
@@ -1788,6 +1872,7 @@ class RecoverySupervisor:
 
         run_status = str(target_run.get("status") or target_run.get("state") or "").lower()
         if run_status in ACTIVE_RUN_STATES or bool(target_run.get("active") or target_run.get("running")):
+            record.pop("block_reason", None)
             self._record_event(
                 record,
                 "reconcile_still_running",
@@ -1796,7 +1881,14 @@ class RecoverySupervisor:
             )
             return self._persist(record, claim_idempotency=execute)
 
-        if run_status == "succeeded" and not target_run.get("error"):
+        completed_ok = (
+            run_status == "completed"
+            and _completed_run_has_evidence(target_run)
+            and not target_run.get("error")
+            and not _run_output_has_provider_failure(target_run)
+        )
+        if (run_status == "succeeded" and not target_run.get("error")) or completed_ok:
+            record.pop("block_reason", None)
             record["external_action_receipts"].append(
                 {"action": "automations.runs.reconciled", "at": run.now(), "receipt": _allowlisted_receipt(target_run)}
             )
@@ -1811,7 +1903,11 @@ class RecoverySupervisor:
             )
             return self._persist(record, claim_idempotency=execute)
 
-        if run_status in TERMINAL_FAILED_RUN_STATES:
+        completed_err = run_status == "completed" and (
+            bool(target_run.get("error")) or _run_output_has_provider_failure(target_run)
+        )
+        if run_status in TERMINAL_FAILED_RUN_STATES or completed_err:
+            record.pop("block_reason", None)
             classification = run.classify_worker_failure(target_run, run_text)
             record["verification_evidence"]["recovery_run_classification"] = classification
             record["external_action_receipts"].append(
