@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh the model catalog for Orca worker fallback
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/orca-fallback
+ExecStart=/usr/bin/python3 %h/orca-fallback/catalog.py refresh --quiet

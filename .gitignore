@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+settings.json
+selection.json
+catalog.json
+benchmarks.json
+*.tmp
+.DS_Store

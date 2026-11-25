@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "roles": {
+    "orchestrator": [
+      {"key": "codex:gpt-6.2-sol", "effort": "high"},
+      {"key": "antigravity:gemini-4-hydrogen-high"},
+      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"}
+    ],
+    "implementation": [
+      {"key": "codex:gpt-6.2-sol", "effort": "high"},
+      {"key": "antigravity:gemini-4-hydrogen-high"},
+      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"}
+    ],
+    "review": [
+      {"key": "antigravity:gemini-4-hydrogen-high"},
+      {"key": "codex:gpt-6.2-sol", "effort": "high"},
+      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"}
+    ],
+    "documentation": [
+      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"},
+      {"key": "codex:gpt-6-luna", "effort": "low"},
+      {"key": "antigravity:gemini-4-hydrogen-high"}
+    ],
+    "research": [
+      {"key": "codex:gpt-6-luna", "effort": "medium"},
+      {"key": "antigravity:gemini-4-hydrogen-high"},
+      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"}
+    ]
+  }
+}

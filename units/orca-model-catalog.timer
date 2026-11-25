@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh available Orca fallback models every six hours
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=orca-model-catalog.service
+
+[Install]
+WantedBy=timers.target

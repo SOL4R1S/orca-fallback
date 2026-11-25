@@ -1,0 +1,12 @@
+{
+  "orca_cli": "orca-ide",
+  "poll_seconds": 5,
+  "worker_timeout_seconds": 7200,
+  "catalog": "catalog.json",
+  "selection": "selection.json",
+  "sources": {
+    "ocx_url": "http://127.0.0.1:10100/v1/models",
+    "ocx_command": "ocx",
+    "agy_command": "agy"
+  }
+}

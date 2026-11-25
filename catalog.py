@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Discover available models and manage user-selected role fallback chains."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import subprocess
+from typing import Any
+from urllib.request import urlopen
+
+
+ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = Path(os.environ.get("ORCA_FALLBACK_CONFIG", ROOT / "settings.json"))
+if not CONFIG_PATH.exists():
+    CONFIG_PATH = ROOT / "settings.example.json"
+SETTINGS = json.loads(CONFIG_PATH.read_text())
+
+
+def configured_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else ROOT / path
+
+
+CATALOG_PATH = configured_path(SETTINGS["catalog"])
+SELECTION_PATH = configured_path(SETTINGS["selection"])
+EXAMPLE_SELECTION_PATH = ROOT / "selection.example.json"
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_json(path: Path, data: Any) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    os.replace(temporary, path)
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def load_selection() -> dict:
+    path = SELECTION_PATH if SELECTION_PATH.exists() else EXAMPLE_SELECTION_PATH
+    return load_json(path)
+
+
+def discover_ocx(url: str) -> list[dict]:
+    with urlopen(url, timeout=15) as response:
+        payload = json.load(response)
+    models = []
+    models_by_key = {}
+    live_pairs = set()
+    live_ids = set()
+    for item in payload.get("data", []):
+        capabilities = item.get("capabilities", {})
+        efforts = item.get("reasoning_efforts", [])
+        model_id = item["id"]
+        provider = item.get("owned_by", "ocx")
+        if provider == "system" and "/" in model_id:
+            provider = model_id.split("/", 1)[0]
+        live_ids.add(model_id)
+        if model_id.startswith(provider + "/"):
+            live_pairs.add((provider, model_id[len(provider) + 1 :]))
+        else:
+            live_pairs.add((provider, model_id))
+        entry = {
+                "key": f"codex:{model_id}",
+                "agent": "codex",
+                "model": model_id,
+                "provider": provider,
+                "label": model_id,
+                "source": "ocx",
+                "available": True,
+                "input_modalities": capabilities.get("input_modalities", ["text"]),
+                "efforts": [entry["value"] for entry in efforts if "value" in entry],
+            }
+        models.append(entry)
+        models_by_key[entry["key"]] = entry
+    executable = SETTINGS["sources"].get("ocx_command")
+    if executable:
+        saved = subprocess.run(
+            [executable, "models", "list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        saved_payload = json.loads(saved.stdout)
+        for item in saved_payload.get("models", []):
+            pair = (item["provider"], item["model"])
+            provider, model_name = pair
+            model_id = f"{provider}/{model_name}"
+            target = models_by_key.get(f"codex:{model_id}")
+            if target is None and provider == "openai":
+                target = models_by_key.get(f"codex:{model_name}")
+            if target is not None:
+                target["context_window"] = item.get("contextWindow")
+                if item.get("inputModalities"):
+                    target["input_modalities"] = item["inputModalities"]
+                if item.get("reasoningEfforts"):
+                    target["efforts"] = item["reasoningEfforts"]
+                if item.get("price"):
+                    target["pricing"] = item["price"]
+                continue
+            if pair in live_pairs or model_id in live_ids:
+                continue
+            discovery = subprocess.run(
+                [executable, "provider", "test", provider, "--json"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            try:
+                health = json.loads(discovery.stdout)
+            except json.JSONDecodeError:
+                health = {"ok": False, "error": "provider health returned invalid JSON"}
+            models.append(
+                {
+                    "key": f"codex:{model_id}",
+                    "agent": "codex",
+                    "model": model_id,
+                    "provider": provider,
+                    "label": model_id,
+                    "source": "ocx",
+                    "available": False,
+                    "status": "configured_unavailable",
+                    "error": health.get("error", "not present in live model catalog"),
+                    "input_modalities": item.get("inputModalities") or ["text"],
+                    "efforts": item.get("reasoningEfforts") or [],
+                    "context_window": item.get("contextWindow"),
+                    **({"pricing": item["price"]} if item.get("price") else {}),
+                }
+            )
+    return models
+
+
+def discover_agy(executable: str) -> list[dict]:
+    completed = subprocess.run(
+        [executable, "models"],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=True,
+    )
+    models = []
+    for line in completed.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        model_id, label = line.split("\t", 1)
+        models.append(
+            {
+                "key": f"antigravity:{model_id.strip()}",
+                "agent": "antigravity",
+                "model": model_id.strip(),
+                "provider": "antigravity",
+                "label": label.strip(),
+                "source": "agy",
+                "available": True,
+                "input_modalities": ["text", "image"],
+                "efforts": [],
+            }
+        )
+    return models
+
+
+def unavailable_selections(catalog: dict, selection: dict) -> dict:
+    available = {model["key"] for model in catalog["models"]}
+    result = {}
+    for role, entries in selection.get("roles", {}).items():
+        missing = [entry["key"] for entry in entries if entry["key"] not in available]
+        if missing:
+            result[role] = missing
+    return result
+
+
+def refresh(quiet: bool = False) -> dict:
+    sources = SETTINGS["sources"]
+    previous = load_json(CATALOG_PATH) if CATALOG_PATH.exists() else {"models": []}
+    models = []
+    source_status = {}
+    for name, discover, argument in (
+        ("ocx", discover_ocx, sources["ocx_url"]),
+        ("agy", discover_agy, sources["agy_command"]),
+    ):
+        try:
+            discovered = discover(argument)
+            if not discovered:
+                raise RuntimeError("source returned no models")
+            models.extend(discovered)
+            source_status[name] = {"ok": True, "count": len(discovered)}
+        except Exception as error:
+            retained = [m for m in previous["models"] if m["source"] == name]
+            models.extend(retained)
+            source_status[name] = {
+                "ok": False,
+                "error": str(error),
+                "stale_count": len(retained),
+            }
+    if not models:
+        raise RuntimeError("No model source returned a usable catalog")
+    old_keys = {model["key"] for model in previous["models"]}
+    new_keys = {model["key"] for model in models}
+    catalog = {
+        "version": 1,
+        "refreshed_at": now(),
+        "sources": source_status,
+        "models": sorted(models, key=lambda model: model["key"]),
+    }
+    atomic_json(CATALOG_PATH, catalog)
+    selection = load_selection()
+    summary = {
+        "model_count": len(models),
+        "unavailable_count": sum(not model.get("available", True) for model in models),
+        "added": sorted(new_keys - old_keys),
+        "removed": sorted(old_keys - new_keys),
+        "sources": source_status,
+        "unavailable_selections": unavailable_selections(catalog, selection),
+    }
+    if not quiet:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return summary
+
+
+def resolve_providers(role: str) -> list[dict]:
+    catalog = load_json(CATALOG_PATH)
+    selection = load_selection()
+    models = {model["key"]: model for model in catalog["models"]}
+    try:
+        entries = selection["roles"][role]
+    except KeyError as error:
+        raise ValueError(f"Unknown or unconfigured role: {role}") from error
+    providers = []
+    for entry in entries:
+        key = entry["key"]
+        if key not in models:
+            raise ValueError(
+                f"Selected model {key} is unavailable for {role}. "
+                "Refresh the catalog and choose a replacement; no automatic substitution was made."
+            )
+        model = models[key]
+        providers.append(
+            {
+                "name": key,
+                "agent": model["agent"],
+                "model": model["model"],
+                **({"effort": entry["effort"]} if entry.get("effort") else {}),
+            }
+        )
+    if not providers:
+        raise ValueError(f"Role {role} has an empty fallback chain")
+    return providers
+
+
+def list_models(role: str | None) -> None:
+    catalog = load_json(CATALOG_PATH)
+    selection = load_selection()
+    models = catalog["models"]
+    selected = {entry["key"] for entry in selection["roles"].get(role, [])} if role else set()
+    for index, model in enumerate(models, 1):
+        marker = "*" if model["key"] in selected else " "
+        health = "" if model.get("available", True) else "  [unavailable]"
+        print(f"{index:3} {marker} {model['key']}  [{model['label']}]{health}")
+    if role:
+        chain = selection["roles"].get(role, [])
+        print("\nSelected fallback order:")
+        for index, entry in enumerate(chain, 1):
+            effort = f" effort={entry['effort']}" if entry.get("effort") else ""
+            print(f"  {index}. {entry['key']}{effort}")
+
+
+def select(role: str, keys: list[str]) -> None:
+    catalog = load_json(CATALOG_PATH)
+    selection = load_selection()
+    available = {model["key"]: model for model in catalog["models"]}
+    entries = []
+    seen = set()
+    for value in keys:
+        key, separator, effort = value.partition("=")
+        if key not in available:
+            raise ValueError(f"Unknown model key: {key}")
+        if key in seen:
+            raise ValueError(f"Duplicate model in fallback chain: {key}")
+        supported_efforts = available[key].get("efforts", [])
+        if separator and effort not in supported_efforts:
+            raise ValueError(f"Unsupported effort {effort!r} for {key}")
+        seen.add(key)
+        entries.append({"key": key, **({"effort": effort} if separator else {})})
+    if not entries:
+        raise ValueError("Choose at least one model")
+    selection["roles"][role] = entries
+    atomic_json(SELECTION_PATH, selection)
+    print(json.dumps({role: entries}, indent=2, ensure_ascii=False))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    refresh_parser = commands.add_parser("refresh")
+    refresh_parser.add_argument("--quiet", action="store_true")
+    list_parser = commands.add_parser("list")
+    list_parser.add_argument("--role")
+    select_parser = commands.add_parser("select")
+    select_parser.add_argument("--role", required=True)
+    select_parser.add_argument("--models", nargs="+", required=True)
+    args = parser.parse_args()
+    try:
+        if args.command == "refresh":
+            refresh(args.quiet)
+        elif args.command == "list":
+            list_models(args.role)
+        else:
+            select(args.role, args.models)
+    except Exception as error:
+        parser.exit(1, f"error: {error}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
