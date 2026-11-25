@@ -1,5 +1,7 @@
 # Orca Fallback
 
+**English** | [한국어](README.ko.md)
+
 Provider failover and evidence-based model selection for supervised Orca workers.
 
 This is an early public prototype. It discovers models from OpenCodex (OCX) and
