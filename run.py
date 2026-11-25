@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -49,6 +50,28 @@ def append_performance(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def update_cooldown(path: Path, model_key: str, seconds: int) -> None:
+    lock_path = path.with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = json.loads(path.read_text()) if path.exists() else {}
+        if seconds:
+            data[model_key] = time.time() + seconds
+        else:
+            data.pop(model_key, None)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(data, indent=2))
+        os.replace(temporary, path)
+
+
+def cooldown_remaining(path: Path, model_key: str) -> int:
+    if not path.exists():
+        return 0
+    data = json.loads(path.read_text())
+    return max(0, int(data.get(model_key, 0) - time.time()))
 
 
 class Orca:
@@ -172,6 +195,7 @@ def run_job(args: argparse.Namespace) -> dict:
     job_id = uuid4().hex[:12]
     state_path = STATE_DIR / f"{job_id}.json"
     performance_path = STATE_DIR / "performance.jsonl"
+    cooldown_path = STATE_DIR / "cooldowns.json"
     state: dict[str, Any] = {
         "job_id": job_id,
         "title": args.title,
@@ -204,6 +228,18 @@ def run_job(args: argparse.Namespace) -> dict:
     previous_dispatch = None
     try:
         for provider in providers:
+            remaining = cooldown_remaining(cooldown_path, provider["name"])
+            if remaining:
+                state["attempts"].append(
+                    {
+                        "provider": provider["name"],
+                        "model": provider["model"],
+                        "status": "cooldown_skipped",
+                        "remaining_seconds": remaining,
+                    }
+                )
+                write_state(state_path, state)
+                continue
             attempt = {
                 "provider": provider["name"],
                 "agent": provider["agent"],
@@ -258,6 +294,7 @@ def run_job(args: argparse.Namespace) -> dict:
                         "latency_seconds": attempt["latency_seconds"],
                     },
                 )
+                update_cooldown(cooldown_path, provider["name"], 0)
                 return state
 
             if not worker_is_settled(show):
@@ -295,6 +332,11 @@ def run_job(args: argparse.Namespace) -> dict:
                 state.update(status="failed_non_provider", finished_at=now())
                 write_state(state_path, state)
                 return state
+            update_cooldown(
+                cooldown_path,
+                provider["name"],
+                config.get("provider_cooldown_seconds", 900),
+            )
 
         state.update(status="all_providers_failed", finished_at=now())
         write_state(state_path, state)

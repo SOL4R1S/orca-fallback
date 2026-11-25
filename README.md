@@ -21,6 +21,7 @@ cp settings.example.json settings.json
 cp selection.example.json selection.json
 python3 -m unittest discover -s tests -v
 python3 catalog.py refresh
+python3 openrouter.py collect
 ```
 
 Set `ORCA_FALLBACK_CONFIG` to use a configuration outside the repository.
@@ -73,9 +74,21 @@ until the user chooses a replacement.
 The included `units/orca-model-catalog.timer` refreshes this inventory every
 six hours. It updates only `catalog.json`, never the user's selections.
 
+## OpenRouter evidence collection
+
+`openrouter.py` reads the public `/api/v1/models` JSON directly. It collects
+OpenRouter pricing, Artificial Analysis indexes, and Design Arena scores. Exact
+IDs and reviewed aliases are matched conservatively; similar names and different
+versions are not treated as the same model. Raw JSON is cached under
+`~/.cache/orca-fallback/`, while normalized entries retain source URLs,
+collection time, and a source hash.
+
+OpenRouter prices describe OpenRouter usage. OCX subscription and token-plan
+billing can differ, so both values remain separate.
+
 ## Evidence-based recommendations
 
-`recommend.py` ranks available models for each bot role using sourced OCX price
+`recommend.py` ranks available models for each bot role using sourced OCX or OpenRouter price
 metadata, local success/latency observations, and optional public benchmark
 records. It does not infer missing prices or benchmark scores. Public benchmark
 entries require an exact model key, benchmark name, score, source URL, and
@@ -93,15 +106,28 @@ the supplied evidence without tools. `--apply` is the explicit user action that
 replaces a role's chain with the top three displayed candidates. Local real-job
 measurements are appended to `~/.local/state/orca-fallback/performance.jsonl`.
 
+The recommender is deterministic. AI explanation is optional. Results group
+routes for the same underlying model, show alternative providers, and weight
+benchmarks according to the bot role. Local task evidence remains necessary
+before treating a public leaderboard ranking as a production recommendation.
+
+## Cooldowns
+
+Provider failures trigger a configurable cooldown, inspired by LiteLLM and
+Portkey. Subsequent jobs skip that model until the cooldown expires. Successful
+calls clear it. Task and test failures never trigger provider fallback.
+
 ## Design references
 
 - LiteLLM and Portkey inspired explicit retry/fallback policy and provider
   failure handling.
-- OpenRouter's public model API is a planned source for additional price and
-  benchmark evidence.
+- OpenRouter's public model API supplies additional price and benchmark evidence.
 - Orca remains the source of truth for worker lifecycle, terminals, worktrees,
   and task state.
 
 This project does not yet restart an Orca bot's own failed chat with another
 provider, and it does not claim that public benchmark scores predict success on
 a user's private workload.
+
+See [the reuse evaluation](docs/reuse-evaluation.md) for the initial measured
+results and current limitations.

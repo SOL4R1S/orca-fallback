@@ -26,6 +26,26 @@ PROFILES = {
     "documentation": {"quality": 0.20, "reliability": 0.25, "cost": 0.40, "speed": 0.15},
     "research": {"quality": 0.35, "reliability": 0.25, "cost": 0.20, "speed": 0.20},
 }
+ROLE_BENCHMARKS = {
+    "orchestrator": {
+        "artificial_analysis.agentic_index": 0.6,
+        "artificial_analysis.intelligence_index": 0.4,
+    },
+    "implementation": {
+        "artificial_analysis.coding_index": 0.5,
+        "artificial_analysis.intelligence_index": 0.25,
+        "design_arena.models.codecategories.elo": 0.25,
+    },
+    "review": {
+        "artificial_analysis.engineering_index": 0.5,
+        "artificial_analysis.intelligence_index": 0.5,
+    },
+    "documentation": {"artificial_analysis.intelligence_index": 1.0},
+    "research": {
+        "artificial_analysis.intelligence_index": 0.8,
+        "artificial_analysis.multilingual_index": 0.2,
+    },
+}
 
 
 def performance() -> dict:
@@ -54,10 +74,14 @@ def price_per_million(model: dict) -> float | None:
     costs = pricing.get("cost4", {})
     input_price = costs.get("input")
     output_price = costs.get("output")
-    if not isinstance(input_price, (int, float)) or not isinstance(output_price, (int, float)):
-        return None
-    # A transparent comparison workload, not a prediction of actual plan billing.
-    return 0.75 * input_price + 0.25 * output_price
+    if isinstance(input_price, (int, float)) and isinstance(output_price, (int, float)):
+        return 0.75 * input_price + 0.25 * output_price
+    openrouter = model.get("openrouter", {}).get("pricing_per_million", {})
+    input_price = openrouter.get("input")
+    output_price = openrouter.get("output")
+    if isinstance(input_price, (int, float)) and isinstance(output_price, (int, float)):
+        return 0.75 * input_price + 0.25 * output_price
+    return None
 
 
 def benchmark_scores(key: str, benchmarks: dict) -> tuple[dict, list[str]]:
@@ -113,6 +137,7 @@ def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
                 "input_modalities": model.get("input_modalities", []),
                 "comparison_price_usd": price_per_million(model),
                 "pricing": model.get("pricing"),
+                "openrouter": model.get("openrouter"),
                 "benchmark_scores": scores,
                 "benchmark_sources": sources,
                 "local": measurements.get((role, model["key"])),
@@ -135,7 +160,10 @@ def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
             lower_is_better=True,
         ),
     }
-    benchmark_names = sorted({name for c in candidates for name in c["benchmark_scores"]})
+    benchmark_names = [
+        name for name in ROLE_BENCHMARKS[role]
+        if sum(name in c["benchmark_scores"] for c in candidates) >= 2
+    ]
     normalized_benchmarks = {
         name: normalized(
             {c["key"]: c["benchmark_scores"][name] for c in candidates if name in c["benchmark_scores"]}
@@ -148,11 +176,16 @@ def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
             for name, scores in normalized_benchmarks.items()
             if candidate["key"] in scores and scores[candidate["key"]] is not None
         }
-    quality_values = {
-        c["key"]: statistics.mean(c["normalized_benchmark_scores"].values())
-        for c in candidates
-        if c["normalized_benchmark_scores"]
-    }
+    quality_values = {}
+    total_quality_weight = sum(ROLE_BENCHMARKS[role][name] for name in benchmark_names)
+    for candidate in candidates:
+        scores = candidate["normalized_benchmark_scores"]
+        if scores:
+            present_weight = sum(ROLE_BENCHMARKS[role][name] for name in scores)
+            weighted_score = sum(scores[name] * ROLE_BENCHMARKS[role][name] for name in scores)
+            quality_values[candidate["key"]] = (
+                weighted_score / present_weight, present_weight / total_quality_weight
+            )
     weights = PROFILES[role]
     ranked = []
     for candidate in candidates:
@@ -167,10 +200,14 @@ def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
                 contributions[metric] = round(weights[metric] * score, 4)
         quality_score = quality_values.get(key)
         if quality_score is not None:
-            contributions["quality"] = round(weights["quality"] * quality_score, 4)
+            score, ratio = quality_score
+            candidate["quality_evidence_ratio"] = round(ratio, 2)
+            contributions["quality"] = round(weights["quality"] * ratio * score, 4)
+            candidate["evidence_coverage_quality"] = round(weights["quality"] * ratio, 4)
         else:
             unknown.append("quality")
-        known_weight = sum(weights[metric] for metric in contributions)
+        known_weight = sum(weights[metric] for metric in contributions if metric != "quality")
+        known_weight += candidate.get("evidence_coverage_quality", 0)
         candidate["evidence_coverage"] = round(known_weight, 2)
         candidate["partial_score"] = round(sum(contributions.values()), 4)
         candidate["score_is_comparable"] = known_weight == 1.0
@@ -185,12 +222,32 @@ def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
             c["key"],
         )
     )
+    groups = {}
+    for candidate in ranked:
+        group = (candidate.get("openrouter") or {}).get("id") or candidate["key"]
+        groups.setdefault(group, []).append(candidate)
+    recommendations = []
+    for routes in groups.values():
+        routes.sort(
+            key=lambda c: (
+                -c["partial_score"],
+                c["current_selection_rank"] if c["current_selection_rank"] is not None else 9999,
+                c["key"],
+            )
+        )
+        primary = routes[0]
+        primary["alternative_routes"] = [candidate["key"] for candidate in routes[1:]]
+        recommendations.append(primary)
+    recommendations.sort(
+        key=lambda c: (-c["evidence_coverage"], -c["partial_score"], c["key"])
+    )
     return {
         "role": role,
         "candidate_count": len(candidates),
+        "model_group_count": len(groups),
         "ranking_policy": "Evidence coverage first, then partial score. Missing metrics never count as good scores.",
-        "price_policy": "75% input + 25% output per million tokens from sourced OCX estimates. Plan billing may differ.",
-        "recommendations": ranked[:limit],
+        "price_policy": "75% input + 25% output per million tokens from OCX or OpenRouter estimates. Plan billing may differ.",
+        "recommendations": recommendations[:limit],
         "selection_changed": False,
     }
 

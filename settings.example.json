@@ -2,11 +2,13 @@
   "orca_cli": "orca-ide",
   "poll_seconds": 5,
   "worker_timeout_seconds": 7200,
+  "provider_cooldown_seconds": 900,
   "catalog": "catalog.json",
   "selection": "selection.json",
   "sources": {
     "ocx_url": "http://127.0.0.1:10100/v1/models",
     "ocx_command": "ocx",
-    "agy_command": "agy"
+    "agy_command": "agy",
+    "openrouter_url": "https://openrouter.ai/api/v1/models"
   }
 }

@@ -5,3 +5,4 @@ Description=Refresh the model catalog for Orca worker fallback
 Type=oneshot
 WorkingDirectory=%h/orca-fallback
 ExecStart=/usr/bin/python3 %h/orca-fallback/catalog.py refresh --quiet
+ExecStart=/usr/bin/python3 %h/orca-fallback/openrouter.py collect --quiet
