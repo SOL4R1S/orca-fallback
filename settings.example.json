@@ -5,6 +5,14 @@
   "provider_cooldown_seconds": 900,
   "catalog": "catalog.json",
   "selection": "selection.json",
+  "recovery": {
+    "auto_resume_automation": false,
+    "return_to_preferred_on_next_task": true,
+    "delayed_resume_delay_seconds": 900,
+    "health_probe_timeout_seconds": 30,
+    "bots_dir": "~/.orca/bots",
+    "once_deadline_seconds": 300
+  },
   "sources": {
     "ocx_url": "http://127.0.0.1:10100/v1/models",
     "ocx_command": "ocx",

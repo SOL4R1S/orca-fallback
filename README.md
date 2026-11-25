@@ -28,6 +28,9 @@ Set `ORCA_FALLBACK_CONFIG` to use a configuration outside the repository.
 `settings.json`, `selection.json`, generated catalogs, benchmarks, credentials,
 and runtime measurements are intentionally excluded from version control.
 
+The bot/automation recovery supervisor is experimental; see
+[its validation status](docs/recovery-validation.md) before any live execution.
+
 ## Execute a task
 
 Runs an existing-worktree Orca task through the models selected for a role. A retry is
@@ -45,9 +48,93 @@ The task file must contain the complete request and acceptance criteria.
 The command prints a final JSON result. Every attempt, actual model, dispatch,
 and error excerpt is also stored in `~/.local/state/orca-fallback/`.
 
-This first version handles supervised workers. It does not restart Atlas's own
-bot chat with a different provider. If the runner loses contact with a live or
-uncertain worker, it stops instead of risking a duplicate implementation.
+This first version handles supervised workers and now includes a shared dispatch
+entry point (`dispatch.py`) and a bounded recovery supervisor (`recovery.py`)
+for workers, bot chats, and scheduled automations. If the runner or supervisor
+loses contact with a live or uncertain target, it stops in a `blocked` state
+instead of killing PIDs or risking duplicate execution.
+
+## Shared dispatch and bounded recovery
+
+### Shared dispatch (`dispatch.py`)
+
+Bots and automations should invoke `dispatch.py` instead of launching providers
+directly. It requires an explicit `--role` and `--lane`, persists a redacted
+handoff/audit record under `~/.local/state/orca-fallback/dispatches/`, and
+invokes `run.py`:
+
+```sh
+python3 ~/orca-fallback/dispatch.py \
+  --worktree /path/to/repository \
+  --title 'Example task' \
+  --spec-file /path/to/task.md \
+  --role implementation \
+  --lane economy \
+  --caller-kind bot \
+  --bot atlas \
+  --chat-id chat_123
+```
+
+Pass `--dry-run` to inspect provider selection and persist a preview without
+launching a worker.
+
+### Recovery supervisor (`recovery.py`)
+
+`recovery.py` defaults to read-only dry-run mode. Live mutations require an
+explicit `--execute` flag.
+
+```sh
+# Dry-run preview (default)
+python3 ~/orca-fallback/recovery.py recover \
+  --kind bot_chat --bot atlas --chat-id chat_123 \
+  --role implementation --lane premium --failed-provider codex:gpt-6.2-sol
+
+# Live execution (creates a disabled one-time recovery automation and triggers it once -> waiting_for_run)
+python3 ~/orca-fallback/recovery.py recover \
+  --kind bot_chat --bot atlas --chat-id chat_123 \
+  --role implementation --lane premium --failed-provider codex:gpt-6.2-sol --execute
+
+# Reconcile an accepted recovery run against terminal status before marking recovered
+python3 ~/orca-fallback/recovery.py reconcile --recovery-id <id> --execute
+
+# Run the isolated, loopback-only live E2E harness (creates disposable temp ORCA_USER_DATA_PATH)
+python3 ~/orca-fallback/scripts/e2e_isolated.py
+```
+
+Key safety guarantees:
+- **Idempotency & file locking**: Every live recovery, reconciliation, and
+  delayed resume acquires a per-key `flock` under
+  `~/.local/state/orca-fallback/recoveries/by_key/` and returns deduplicated
+  results while a run is `waiting_for_run` or completed.
+- **Settled-before-recovery & no PID kills**: Workers require `worker-show`
+  settled failure, and bot chats require `bot chats` plus `agent show` and
+  `agent read` (`orca_session_id:<chat_id>`) proving `state=done`. Active or
+  uncertain targets return `blocked` (`active_or_uncertain`) with zero
+  mutations. Orca has `worker-stop` for supervised dispatches, but no general
+  agent-stop or automation-cancel command, so no stop APIs are invented.
+- **Provider-only fallback**: Never falls back on test failures, lint failures,
+  ordinary implementation errors, or human approval/input waits
+  (`observation.agentWait`). Each provider in a role/lane is attempted once,
+  without looping back or escalating lanes automatically.
+- **Bot chats start a NEW chat without double fire**: Cross-provider bot chat
+  recovery resolves bot display names via `~/.orca/bots/*/bot.json`, preserves
+  `SOUL.md`, `MEMORY.md`, and `items`, and creates a `--disabled` one-time bot
+  automation (`--runs-in new --once --by ...`) triggered once by `automations run`
+  (`waiting_for_run` until `reconcile` verifies terminal success).
+- **Scheduled automations pause first**: Disables the original schedule before
+  running recovery and keeps it disabled by default unless
+  `recovery.auto_resume_automation` is `true` in `settings.json` **and** the
+  recovery run is reconciled as terminal `succeeded`.
+- **Next-task preferred return & delayed health-gated resume**: Active fallback
+  tasks never switch mid-task; returning to the preferred provider after a quota
+  reset applies to the next task. If all providers in a lane are unavailable, a
+  `delayed_resume_plan` is persisted; `recovery.py resume` only considers unused
+  eligible providers (never looping back to already-attempted models, blocking
+  for a user decision when none remain) and requires a bounded read-only
+  inference probe (`codex exec -s read-only` or `agy --print --sandbox`)
+  returning exact `OK` before starting work.
+- **Secret redaction**: API keys, Bearer tokens, Slack/GitHub/Linear tokens, and
+  Orca pairing codes are redacted in persisted state and receipts.
 
 ## Model discovery and selection
 
@@ -146,9 +233,10 @@ calls clear it. Task and test failures never trigger provider fallback.
 - Orca remains the source of truth for worker lifecycle, terminals, worktrees,
   and task state.
 
-This project does not yet restart an Orca bot's own failed chat with another
-provider, and it does not claim that public benchmark scores predict success on
-a user's private workload.
+Cross-provider bot chat recovery starts a **new** bot chat through a one-time
+bot automation (`--runs-in new`); it never claims an existing chat can switch
+providers in place. This project also does not claim that public benchmark scores
+predict success on a user's private workload.
 
 See [the reuse evaluation](docs/reuse-evaluation.md) for the initial measured
 results and current limitations.
