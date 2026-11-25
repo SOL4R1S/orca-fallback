@@ -11,15 +11,20 @@ Safety gates:
 
 from __future__ import annotations
 
+import base64
+import ctypes
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -76,6 +81,169 @@ class IsolatedOrca(run.Orca):
             err_payload = run.redact_secrets(result.get("error", result))
             raise RuntimeError(json.dumps(err_payload, ensure_ascii=False))
         return result.get("result", result)
+
+
+class _IsolatedOwnerRpcClient:
+    """Loopback-only E2EE WebSocket client for creating/deleting disposable test bots."""
+
+    def __init__(self, endpoint: str, expected_port: int, server_pk_b64: str, device_token: str):
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "ws" or parsed.hostname != "127.0.0.1" or parsed.port != expected_port:
+            raise RuntimeError(f"Safety gate failed: non-loopback pairing endpoint {endpoint!r}")
+        lib = ctypes.CDLL("libsodium.so.23")
+        if lib.sodium_init() < 0:
+            raise RuntimeError("sodium_init failed")
+        self._lib = lib
+        self._nonce_len = lib.crypto_box_noncebytes()
+        self._mac_len = lib.crypto_box_macbytes()
+
+        pk = ctypes.create_string_buffer(lib.crypto_box_publickeybytes())
+        sk = ctypes.create_string_buffer(lib.crypto_box_secretkeybytes())
+        if lib.crypto_box_keypair(pk, sk) != 0:
+            raise RuntimeError("crypto_box_keypair failed")
+        shared = ctypes.create_string_buffer(lib.crypto_box_beforenmbytes())
+        server_pk = base64.b64decode(server_pk_b64)
+        if lib.crypto_box_beforenm(shared, server_pk, sk.raw) != 0:
+            raise RuntimeError("crypto_box_beforenm failed")
+        self._shared = shared.raw
+
+        self._sock = socket.create_connection(("127.0.0.1", expected_port), timeout=15)
+        self._buf = b""
+        ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        self._sock.sendall(
+            (
+                f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{expected_port}\r\n"
+                f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {ws_key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ).encode("ascii")
+        )
+        while b"\r\n\r\n" not in self._buf:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("WebSocket EOF during HTTP upgrade")
+            self._buf += chunk
+        hdr, self._buf = self._buf.split(b"\r\n\r\n", 1)
+        if b"101 " not in hdr.splitlines()[0]:
+            raise RuntimeError("WebSocket HTTP upgrade rejected")
+
+        # Legacy e2ee_hello without caller.orca-cli.v1 capability so caller is owner paired-device
+        self._send_text(json.dumps({"type": "e2ee_hello", "publicKeyB64": base64.b64encode(pk.raw).decode("ascii")}))
+        hello_reply = json.loads(self._recv_text())
+        if hello_reply.get("type") != "e2ee_ready":
+            raise RuntimeError(f"Unexpected E2EE hello reply: {hello_reply}")
+
+        self._send_text(self._seal(json.dumps({"type": "e2ee_auth", "deviceToken": device_token})))
+        auth_reply = json.loads(self._open(self._recv_text()))
+        if auth_reply.get("type") != "e2ee_authenticated":
+            raise RuntimeError(f"E2EE auth failed: {auth_reply}")
+
+    def _seal(self, plaintext: str) -> str:
+        msg = plaintext.encode("utf-8")
+        nonce = os.urandom(self._nonce_len)
+        ct = ctypes.create_string_buffer(len(msg) + self._mac_len)
+        if self._lib.crypto_box_easy_afternm(ct, msg, ctypes.c_ulonglong(len(msg)), nonce, self._shared) != 0:
+            raise RuntimeError("crypto_box_easy_afternm failed")
+        return base64.b64encode(nonce + ct.raw).decode("ascii")
+
+    def _open(self, frame_b64: str) -> str:
+        raw = base64.b64decode(frame_b64)
+        nonce, ct = raw[: self._nonce_len], raw[self._nonce_len :]
+        pt = ctypes.create_string_buffer(len(ct) - self._mac_len)
+        if self._lib.crypto_box_open_easy_afternm(pt, ct, ctypes.c_ulonglong(len(ct)), nonce, self._shared) != 0:
+            raise RuntimeError("crypto_box_open_easy_afternm failed")
+        return pt.raw.decode("utf-8")
+
+    def _read_exact(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            chunk = self._sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("WebSocket EOF")
+            self._buf += chunk
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def _send_text(self, text: str) -> None:
+        payload = text.encode("utf-8")
+        mask = os.urandom(4)
+        header = bytearray([0x81])
+        ln = len(payload)
+        if ln < 126:
+            header.append(0x80 | ln)
+        elif ln < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", ln))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", ln))
+        header.extend(mask)
+        self._sock.sendall(bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def _recv_text(self) -> str:
+        while True:
+            b1, b2 = self._read_exact(2)
+            opcode, masked, ln = b1 & 0x0F, (b2 & 0x80) != 0, b2 & 0x7F
+            if ln == 126:
+                ln = struct.unpack("!H", self._read_exact(2))[0]
+            elif ln == 127:
+                ln = struct.unpack("!Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else b""
+            data = self._read_exact(ln)
+            if masked:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if opcode == 0x8:
+                raise RuntimeError("WebSocket closed")
+            if opcode == 0x9:
+                self._sock.sendall(bytes([0x8A, 0x80]) + b"\x00\x00\x00\x00")
+                continue
+            if opcode == 0xA:
+                continue
+            return data.decode("utf-8")
+
+    def rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        req_id = f"e2e-{int(time.time() * 1000)}-{method}"
+        req: dict[str, Any] = {"id": req_id, "method": method}
+        if params is not None:
+            req["params"] = params
+        self._send_text(self._seal(json.dumps(req)))
+        while True:
+            msg = json.loads(self._open(self._recv_text()))
+            if msg.get("id") == req_id:
+                if msg.get("error"):
+                    raise RuntimeError(f"RPC error {method}: {msg['error']}")
+                return msg.get("result") or {}
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+def _read_loopback_pairing_offer(serve_proc: subprocess.Popen[str], expected_port: int, timeout_seconds: int = 15) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if serve_proc.stdout is None:
+            break
+        line = serve_proc.stdout.readline().strip()
+        if not line:
+            if serve_proc.poll() is not None:
+                break
+            continue
+        if "orca_server_ready" in line:
+            ready = json.loads(line)
+            pairing = ready.get("pairing") or {}
+            url = str(pairing.get("url") or "")
+            if not pairing.get("available") or "code=" not in url:
+                raise RuntimeError("Loopback pairing offer unavailable from isolated serve")
+            code = url.split("code=", 1)[1]
+            pad = "=" * ((4 - len(code) % 4) % 4)
+            offer = json.loads(base64.urlsafe_b64decode(code + pad).decode("utf-8"))
+            endpoint = str(offer.get("endpoint") or "")
+            parsed = urlparse(endpoint)
+            if parsed.hostname != "127.0.0.1" or parsed.port != expected_port:
+                raise RuntimeError(f"Safety gate failed: pairing endpoint {endpoint!r} is not loopback :{expected_port}")
+            return offer
+    raise RuntimeError("Isolated orca-ide serve did not emit orca_server_ready")
 
 
 def _wait_for_runtime(env: dict[str, str], timeout_seconds: int = 20) -> dict[str, Any]:
@@ -170,6 +338,14 @@ def run_isolated_e2e() -> dict[str, Any]:
                             "pricing": {"cost4": {"input": 0.2, "output": 0.6}},
                         },
                         {
+                            "key": "codex:gpt-6.2-sol",
+                            "agent": "codex",
+                            "model": "gpt-6.2-sol",
+                            "provider": "openai",
+                            "available": True,
+                            "pricing": {"cost4": {"input": 2.5, "output": 10.0}},
+                        },
+                        {
                             "key": "antigravity:gemini-4-hydrogen-high",
                             "agent": "antigravity",
                             "model": "gemini-4-hydrogen-high",
@@ -201,6 +377,7 @@ def run_isolated_e2e() -> dict[str, Any]:
                                 "premium": {
                                     "budget": {"max_comparison_price_usd": 8, "min_intelligence_index": 40},
                                     "models": [
+                                        {"key": "codex:gpt-6.2-sol", "effort": "high"},
                                         {"key": "antigravity:gemini-4-hydrogen-high"},
                                     ],
                                 },
@@ -217,6 +394,7 @@ def run_isolated_e2e() -> dict[str, Any]:
                     "entries": [
                         {"model_key": "codex:nonexistent-e2e-model-xyz", "benchmark": "artificial_analysis.intelligence_index", "score": 25},
                         {"model_key": "codex:gpt-6-luna", "benchmark": "artificial_analysis.intelligence_index", "score": 30},
+                        {"model_key": "codex:gpt-6.2-sol", "benchmark": "artificial_analysis.intelligence_index", "score": 68},
                         {"model_key": "antigravity:gemini-4-hydrogen-high", "benchmark": "artificial_analysis.intelligence_index", "score": 62},
                     ]
                 }
@@ -234,14 +412,17 @@ def run_isolated_e2e() -> dict[str, Any]:
         run.SETTINGS["worker_timeout_seconds"] = 45
 
         serve_proc = subprocess.Popen(
-            ["orca-ide", "serve", "--port", str(port), "--bind", "127.0.0.1", "--no-pairing", "--json"],
+            ["orca-ide", "serve", "--port", str(port), "--bind", "127.0.0.1", "--json"],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
         created_auto_ids: list[str] = []
+        created_bot_id: str | None = None
+        rpc_client: _IsolatedOwnerRpcClient | None = None
         try:
+            pairing_offer = _read_loopback_pairing_offer(serve_proc, port)
             status_res = _wait_for_runtime(env)
             report["runtime_id"] = status_res["runtime"]["runtimeId"]
             orca = IsolatedOrca("orca-ide", env, repo)
@@ -636,22 +817,196 @@ def run_isolated_e2e() -> dict[str, Any]:
                 "ambiguous_launch_blocked_then_reconciled": True,
             }
 
-            # 6. Headless bot-creation limitation check (honest gate check)
-            bots_after = orca.call("bot", "list").get("bots", [])
-            report["scenarios"]["headless_bot_creation_gate"] = {
-                "supported_without_owner_ui": False,
-                "bots_in_isolated_runtime": len(bots_after),
-                "note": "orca-ide bot create requires owner UI card acceptance (--offer); mutating bot-chat E2E cannot run headlessly without touching production bots.",
+            # 6. Disposable test bot creation via loopback owner RPC & full cross-provider bot-chat recovery E2E
+            rpc_client = _IsolatedOwnerRpcClient(
+                pairing_offer["endpoint"],
+                port,
+                pairing_offer["publicKeyB64"],
+                pairing_offer["deviceToken"],
+            )
+            bot_obj = rpc_client.rpc(
+                "bots.create",
+                {
+                    "name": "E2E Disposable Bot",
+                    "agent": "codex",
+                    "permissionMode": "ask",
+                    "takingOver": True,
+                },
+            )["bot"]
+            created_bot_id = bot_obj["id"]
+            bot_folder = bot_obj["folder"]
+            assert bot_obj.get("slack") is None and bot_obj.get("linear") is None and bot_obj.get("github") is None, bot_obj
+
+            bot_dir = ud / "bots" / bot_folder
+            soul_marker = "# E2E Disposable Bot SOUL\nPreserve SOUL_MARKER_2026 across recovery.\n"
+            memory_marker = "# E2E Disposable Bot MEMORY\nPreserve MEMORY_MARKER_2026 across recovery.\n"
+            items_marker = json.dumps([{"id": "101", "title": "Preserve ITEMS_MARKER_2026"}])
+            (bot_dir / "SOUL.md").write_text(soul_marker, encoding="utf-8")
+            (bot_dir / "MEMORY.md").write_text(memory_marker, encoding="utf-8")
+            (bot_dir / "items.json").write_text(items_marker, encoding="utf-8")
+
+            # Verify ORCA_USER_DATA_PATH setup-path isolation resolves ud/bots automatically and handles bot display names
+            prev_ud_env = os.environ.get("ORCA_USER_DATA_PATH")
+            os.environ["ORCA_USER_DATA_PATH"] = str(ud)
+            try:
+                bot_adapter = recovery.OrcaRecoveryAdapter(orca=orca)
+            finally:
+                if prev_ud_env is None:
+                    os.environ.pop("ORCA_USER_DATA_PATH", None)
+                else:
+                    os.environ["ORCA_USER_DATA_PATH"] = prev_ud_env
+            assert bot_adapter.bots_dir == ud.resolve() / "bots", bot_adapter.bots_dir
+            assets_by_name = bot_adapter.read_bot_assets("E2E Disposable Bot")
+            assets_by_id = bot_adapter.read_bot_assets(created_bot_id)
+            assert assets_by_name["resolved_bot"] == created_bot_id == assets_by_id["resolved_bot"], assets_by_name
+            assert assets_by_name["soul_present"] and assets_by_name["memory_present"] and assets_by_name["items_present"]
+
+            # Trigger a harmless failing bot chat on an invalid model in a disabled one-time automation
+            by_fail_iso = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            fail_bot_auto = recovery._unwrap_automation(
+                orca.call(
+                    "automations",
+                    "create",
+                    "--name",
+                    "E2E Bot Failing Chat",
+                    "--bot",
+                    created_bot_id,
+                    "--runs-in",
+                    "new",
+                    "--once",
+                    "--disabled",
+                    "--by",
+                    by_fail_iso,
+                    "--agent",
+                    "codex",
+                    "--model",
+                    "nonexistent-e2e-model-xyz",
+                    "--prompt",
+                    "Reply with exact text E2E_BOT_RECOVERED_OK and nothing else.",
+                )
+            )
+            fail_bot_auto_id = fail_bot_auto["id"]
+            created_auto_ids.append(fail_bot_auto_id)
+            orca.call("automations", "run", fail_bot_auto_id)
+            term_bot_fail = _wait_for_automation_terminal_run(orca, fail_bot_auto_id, timeout_seconds=60)
+            bad_chat_id = term_bot_fail["run"]["chatSessionId"]
+            assert bad_chat_id, term_bot_fail
+
+            fail_show = bot_adapter.agent_show(bad_chat_id)
+            fail_read = bot_adapter.agent_read(bad_chat_id, limit=20)
+            assert isinstance(fail_show.get("places"), list), fail_show
+            assert any(isinstance(e, dict) and e.get("kind") == "error" for e in fail_read.get("entries", [])), fail_read
+
+            sup_bot = recovery.RecoverySupervisor(adapter=bot_adapter, state_dir=state_dir)
+            bot_rec = sup_bot.recover(
+                kind="bot_chat",
+                role="implementation",
+                lane="premium",
+                bot=created_bot_id,
+                chat_id=bad_chat_id,
+                failed_provider="codex:gpt-6.2-sol",
+                idempotency_key="e2e-bot-chat-recovery-1",
+                execute=True,
+            )
+            assert bot_rec["status"] == "waiting_for_run", bot_rec
+            assert bot_rec["actual_provider"] == "antigravity:gemini-4-hydrogen-high", bot_rec
+            bot_rec_auto_id = bot_rec["recovery_automation_id"]
+            bot_rec_run_id = bot_rec["recovery_run_id"]
+            assert bot_rec_auto_id and bot_rec_run_id, bot_rec
+            created_auto_ids.append(bot_rec_auto_id)
+
+            # Verify canonical deduplication via display-name alias + distinct caller idempotency key
+            autos_count_before_dup = len(orca.call("automations", "list").get("automations", []))
+            bot_dup = sup_bot.recover(
+                kind="bot_chat",
+                role="implementation",
+                lane="premium",
+                bot="E2E Disposable Bot",
+                chat_id=bad_chat_id,
+                failed_provider="codex:gpt-6.2-sol",
+                idempotency_key="e2e-bot-chat-recovery-alias",
+                execute=True,
+            )
+            autos_count_after_dup = len(orca.call("automations", "list").get("automations", []))
+            assert bot_dup.get("deduplicated") is True and bot_dup["recovery_id"] == bot_rec["recovery_id"], bot_dup
+            assert autos_count_before_dup == autos_count_after_dup
+
+            # Verify replacement bot automation properties: disabled, --once, --runs-in new, antigravity model
+            bot_rec_auto_show = bot_adapter.automations_show(bot_rec_auto_id)
+            assert bot_rec_auto_show["enabled"] is False, bot_rec_auto_show
+            assert isinstance(bot_rec_auto_show.get("once"), dict) and bot_rec_auto_show["once"].get("by"), bot_rec_auto_show
+            bot_cfg = bot_rec_auto_show.get("bot") or {}
+            assert bot_cfg.get("runsIn") == "new", bot_rec_auto_show
+            assert bot_cfg.get("botId") == created_bot_id, bot_rec_auto_show
+            agent_setup = bot_cfg.get("agentSetup") or {}
+            assert agent_setup.get("agent") == "antigravity", bot_rec_auto_show
+            assert (agent_setup.get("launch") or {}).get("model") == "gemini-4-hydrogen-high", bot_rec_auto_show
+            assert bot_rec_auto_show.get("agentId") == "antigravity", bot_rec_auto_show
+
+            # Wait for recovery run settlement & reconcile to terminal recovered
+            term_bot_rec = _wait_for_automation_terminal_run(orca, bot_rec_auto_id, timeout_seconds=60)
+            bot_runs_all = bot_adapter.automations_runs(bot_rec_auto_id).get("runs", [])
+            assert len(bot_runs_all) == 1, bot_runs_all
+            assert bot_runs_all[0]["id"] == bot_rec_run_id, bot_runs_all
+            assert bot_runs_all[0]["status"] == "completed", bot_runs_all[0]
+            new_chat_id = bot_runs_all[0].get("chatSessionId")
+            assert new_chat_id and new_chat_id != bad_chat_id, bot_runs_all[0]
+
+            bot_reconciled = sup_bot.reconcile(bot_rec["recovery_id"], execute=True)
+            assert bot_reconciled["status"] == "recovered", bot_reconciled
+
+            # Verify new bot chat exists separately, and SOUL/MEMORY/Items preserved untouched
+            chats_after = orca.call("bot", "chats", "--bot", created_bot_id, "--all").get("chats", [])
+            chat_ids_after = [c["id"] for c in chats_after]
+            assert bad_chat_id in chat_ids_after and new_chat_id in chat_ids_after, chat_ids_after
+            assert (bot_dir / "SOUL.md").read_text(encoding="utf-8") == soul_marker
+            assert (bot_dir / "MEMORY.md").read_text(encoding="utf-8") == memory_marker
+            assert (bot_dir / "items.json").read_text(encoding="utf-8") == items_marker
+
+            report["scenarios"]["disposable_bot_chat_recovery"] = {
+                "ok": True,
+                "bot_id": created_bot_id,
+                "bad_chat_id": bad_chat_id,
+                "bad_chat_status": term_bot_fail["run"]["status"],
+                "bad_chat_show_places_count": len(fail_show.get("places", [])),
+                "bad_chat_error_entry": recovery.run.latest_turn_failure_text(fail_read),
+                "recovery_provider": bot_reconciled["actual_provider"],
+                "recovery_automation_id": bot_rec_auto_id,
+                "recovery_run_id": bot_rec_run_id,
+                "recovery_run_count": len(bot_runs_all),
+                "new_chat_id": new_chat_id,
+                "runs_in": bot_cfg.get("runsIn"),
+                "reconciled_status": bot_reconciled["status"],
+                "deduplicated_canonical_alias": True,
+                "assets_preserved": {
+                    "soul_present": bot_reconciled["verification_evidence"]["bot_assets"]["soul_present"],
+                    "memory_present": bot_reconciled["verification_evidence"]["bot_assets"]["memory_present"],
+                    "items_present": bot_reconciled["verification_evidence"]["bot_assets"]["items_present"],
+                },
+                "external_connectors": {"slack": None, "linear": None, "github": None},
             }
 
-            # Cleanup automations inside isolated runtime before exit
+            # Cleanup automations and disposable bot inside isolated runtime before exit
             for aid in created_auto_ids:
                 try:
                     orca.call("automations", "remove", aid)
                 except Exception:
                     pass
+            rpc_client.rpc("bots.delete", {"botId": created_bot_id})
+            deleted_bot_id = created_bot_id
+            created_bot_id = None
+            assert orca.call("bot", "list").get("bots", []) == []
+            assert orca.call("automations", "list").get("automations", []) == []
             report["cleanup"]["removed_automations"] = created_auto_ids
+            report["cleanup"]["deleted_bot_id"] = deleted_bot_id
         finally:
+            if rpc_client is not None:
+                if created_bot_id is not None:
+                    try:
+                        rpc_client.rpc("bots.delete", {"botId": created_bot_id})
+                    except Exception:
+                        pass
+                rpc_client.close()
             catalog.CATALOG_PATH = orig_cat
             catalog.SELECTION_PATH = orig_sel
             catalog.ROOT = orig_root

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -23,8 +24,10 @@ from catalog import SETTINGS, resolve_policy
 import run
 
 
-SETTLED_FAILED_RUN_STATES = frozenset({"failed", "error", "errored", "timed_out"})
-TERMINAL_FAILED_RUN_STATES = frozenset({"failed", "error", "errored", "timed_out", "cancelled", "canceled"})
+SETTLED_FAILED_RUN_STATES = frozenset({"failed", "error", "errored", "timed_out", "dispatch_failed"})
+TERMINAL_FAILED_RUN_STATES = frozenset(
+    {"failed", "error", "errored", "timed_out", "cancelled", "canceled", "dispatch_failed"}
+)
 ACTIVE_RUN_STATES = frozenset(
     {
         "running",
@@ -34,6 +37,7 @@ ACTIVE_RUN_STATES = frozenset(
         "starting",
         "started",
         "accepted",
+        "dispatching",
         "dispatched",
         "in_progress",
         "streaming",
@@ -141,11 +145,36 @@ def _automation_worktree(auto: dict[str, Any]) -> str | None:
     return None
 
 
+def _automation_bot_id(auto: dict[str, Any]) -> str | None:
+    bot_field = auto.get("bot")
+    if isinstance(bot_field, dict):
+        bid = bot_field.get("botId") or bot_field.get("id")
+        if isinstance(bid, str) and bid.strip():
+            return bid.strip()
+    elif isinstance(bot_field, str) and bot_field.strip():
+        return bot_field.strip()
+    bid = auto.get("botId")
+    return bid.strip() if isinstance(bid, str) and bid.strip() else None
+
+
+def _automation_results_to(auto: dict[str, Any]) -> str | None:
+    bot_field = auto.get("bot")
+    if isinstance(bot_field, dict):
+        val = bot_field.get("resultsTo")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    val = auto.get("resultsTo")
+    return val.strip() if isinstance(val, str) and val.strip() else None
+
+
 def _automation_provider_key(auto: dict[str, Any]) -> str | None:
     if isinstance(auto.get("modelKey"), str) and auto["modelKey"].strip():
         return auto["modelKey"].strip()
-    agent = auto.get("agent") or auto.get("provider") or auto.get("agentId")
-    model = auto.get("model")
+    bot_field = auto.get("bot") if isinstance(auto.get("bot"), dict) else {}
+    agent_setup = bot_field.get("agentSetup") if isinstance(bot_field.get("agentSetup"), dict) else {}
+    launch = agent_setup.get("launch") if isinstance(agent_setup.get("launch"), dict) else {}
+    agent = agent_setup.get("agent") or auto.get("agent") or auto.get("provider") or auto.get("agentId")
+    model = launch.get("model") or auto.get("model")
     if not model:
         extra = auto.get("extraAgentArgs") or (
             (auto.get("launchSetup") or {}).get("extraAgentArgs")
@@ -245,12 +274,29 @@ def _has_side_effect_or_claim(record: dict[str, Any]) -> bool:
     )
 
 
+def _default_bots_dir() -> Path:
+    configured = _recovery_settings()["bots_dir"]
+    user_data = os.environ.get("ORCA_USER_DATA_PATH", "").strip()
+    if user_data and configured == "~/.orca/bots":
+        ud_path = Path(user_data).expanduser().resolve()
+        home = Path.home().resolve()
+        default_dirs = {
+            (home / ".orca").resolve(),
+            (home / ".config" / "Orca").resolve(),
+            (home / ".config" / "orca").resolve(),
+            (home / ".config" / "orca-dev").resolve(),
+        }
+        if ud_path not in default_dirs:
+            return ud_path / "bots"
+    return Path(configured).expanduser()
+
+
 class OrcaRecoveryAdapter:
     """Thin adapter around public Orca CLI commands and bounded bot metadata."""
 
     def __init__(self, orca: run.Orca | None = None, *, bots_dir: Path | None = None):
         self.orca = orca or run.Orca(SETTINGS["orca_cli"])
-        self.bots_dir = bots_dir or Path(_recovery_settings()["bots_dir"]).expanduser()
+        self.bots_dir = bots_dir or _default_bots_dir()
 
     def worker_show(self, dispatch_id: str) -> dict[str, Any]:
         return self.orca.call("orchestration", "worker-show", "--dispatch", dispatch_id)
@@ -781,21 +827,31 @@ class RecoverySupervisor:
                 }
 
             show_states = _extract_agent_show_states(agent_show)
+            has_authoritative_show = bool(show_states) or isinstance(agent_show.get("places"), list)
             read_state = str(agent_read.get("state") or agent_read.get("turnState") or "").strip().lower()
-            if not show_states or any(state != "done" for state in show_states) or read_state != "done":
+            entries = _extract_bot_messages(agent_read)
+            latest_entry = entries[-1] if entries else None
+            terminal_error_entry = (
+                isinstance(latest_entry, dict)
+                and str(latest_entry.get("kind") or latest_entry.get("role") or "").strip().lower() == "error"
+            )
+            read_settled = (read_state == "done") or (read_state == "" and terminal_error_entry)
+            if not has_authoritative_show or any(state != "done" for state in show_states) or not read_settled:
                 return {
                     "settled": False,
                     "reason": "active_or_uncertain",
                     "evidence": {
                         "chat": chat,
                         "agent_show": agent_show,
-                        "agent_read_state": read_state or "missing",
+                        "agent_read_state": read_state or ("error_entry" if terminal_error_entry else "missing"),
                         "bot_assets": bot_assets,
                     },
                     "raw_record": chat,
                     "resolved_bot": canonical_bot,
                     "canonical_key": canonical_key,
                 }
+
+            effective_read_state = read_state or ("error_entry" if terminal_error_entry else "done")
 
             audit = self._find_local_audit(chat_id=chat_id)
             verified_failed = (
@@ -810,7 +866,7 @@ class RecoverySupervisor:
                 "evidence": {
                     "chat": chat,
                     "agent_show": agent_show,
-                    "agent_read_state": read_state,
+                    "agent_read_state": effective_read_state,
                     "bot_assets": bot_assets,
                     "excerpt": run.redact_text(latest_text)[-1500:],
                 },
@@ -1460,7 +1516,8 @@ class RecoverySupervisor:
         recovery_id = uuid4().hex[:12]
         settings = self._settings()
         raw_record = inspection.get("raw_record") or {}
-        resolved_bot = inspection.get("resolved_bot") or bot or raw_record.get("bot")
+        resolved_bot = inspection.get("resolved_bot") or bot or _automation_bot_id(raw_record)
+        resolved_results_to = _automation_results_to(raw_record)
         if resolved_bot and kind == "automation":
             resolved_bot = self.adapter.read_bot_assets(resolved_bot).get("resolved_bot") or resolved_bot
         resolved_worktree = str(worktree) if worktree else inspection.get("worktree")
@@ -1512,7 +1569,7 @@ class RecoverySupervisor:
             "original_ids": original_ids,
             "worktree": resolved_worktree,
             "spec_file": str(spec_file.resolve()) if spec_file is not None else None,
-            "results_to": raw_record.get("resultsTo"),
+            "results_to": resolved_results_to,
             "verification_evidence": inspection.get("evidence", {}),
             "mutations": [],
             "external_action_receipts": [],
@@ -1628,7 +1685,7 @@ class RecoverySupervisor:
                 worktree=resolved_worktree,
                 spec_file=spec_file,
                 handoff_prompt=handoff_prompt,
-                results_to=raw_record.get("resultsTo"),
+                results_to=resolved_results_to,
                 execute=execute,
             )
 
@@ -1702,7 +1759,7 @@ class RecoverySupervisor:
                 prompt=handoff_prompt,
                 by_iso=by_iso,
                 item_id=str(resolved_item) if resolved_item is not None else None,
-                results_to=raw_record.get("resultsTo"),
+                results_to=resolved_results_to,
             )
 
         title = f"Recover automation {automation_id}" if kind == "automation" else f"Recover worker {dispatch_id}"
@@ -1729,7 +1786,7 @@ class RecoverySupervisor:
             worktree=resolved_worktree,
             spec_file=spec_file,
             handoff_prompt=handoff_prompt,
-            results_to=raw_record.get("resultsTo"),
+            results_to=resolved_results_to,
             execute=True,
         )
 

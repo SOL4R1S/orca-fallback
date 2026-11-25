@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -1144,6 +1145,125 @@ class RecoveryAndDispatchTests(unittest.TestCase):
         self.assertIsNone(self.supervisor.load_record("../../outside"))
         self.assertIsNone(self.supervisor.load_record(str(outside)))
         self.assertIsNone(self.supervisor.load_record("../outside.json"))
+
+    def test_real_orca_bot_chat_entries_error_and_isolated_bots_dir(self):
+        # 1) Isolated ORCA_USER_DATA_PATH automatically resolves <userData>/bots instead of ~/.orca/bots
+        iso_ud = self.root / "isolated-ud"
+        iso_ud.mkdir()
+        with mock.patch.dict(os.environ, {"ORCA_USER_DATA_PATH": str(iso_ud)}, clear=False):
+            resolved = recovery._default_bots_dir()
+            self.assertEqual(resolved, iso_ud.resolve() / "bots")
+            adapter = recovery.OrcaRecoveryAdapter(orca=self.fake_orca)
+            self.assertEqual(adapter.bots_dir, iso_ud.resolve() / "bots")
+
+        # 2) Real Orca 1.4.274 bot_chat schema: agent show has places=[], agent read uses entries with kind="error"
+        self.fake_orca.chats_by_bot["atlas-orchestrator"] = [
+            {
+                "id": "chat_real_err",
+                "title": "Real Failed Chat",
+                "lastActivityAt": 1795597148062,
+                "lastAsked": "Fix flaky build",
+                "lastSaid": None,
+                "home": False,
+                "self": False,
+                "closed": False,
+            }
+        ]
+        self.fake_orca.agent_shows["chat_real_err"] = {
+            "orcaSessionId": "chat_real_err",
+            "kind": "chat",
+            "places": [],
+        }
+        self.fake_orca.agent_reads["chat_real_err"] = {
+            "orcaSessionId": "chat_real_err",
+            "kind": "chat",
+            "agent": "codex",
+            "source": "chat",
+            "entries": [
+                {"kind": "message", "role": "user", "text": "Fix flaky build"},
+                {
+                    "kind": "error",
+                    "text": "Codex couldn't finish this response. Open Details for more information.",
+                },
+            ],
+            "limited": False,
+        }
+        self.fake_orca.created_automations = []
+        dry = self.supervisor.recover(
+            kind="bot_chat",
+            role="implementation",
+            lane="premium",
+            bot="Atlas · Orchestrator",
+            chat_id="chat_real_err",
+            failed_provider="codex:gpt-6.2-sol",
+            execute=False,
+        )
+        self.assertEqual(dry["status"], "dry_run_planned")
+        self.assertEqual(dry["actual_provider"], "antigravity:gemini-4-hydrogen-high")
+
+        # 3) Missing read state WITHOUT terminal error entry MUST still fail closed as active_or_uncertain
+        self.fake_orca.agent_reads["chat_real_err"]["entries"] = [
+            {"kind": "message", "role": "user", "text": "Fix flaky build"}
+        ]
+        uncertain = self.supervisor.recover(
+            kind="bot_chat",
+            role="implementation",
+            lane="premium",
+            bot="atlas-orchestrator",
+            chat_id="chat_real_err",
+            failed_provider="codex:gpt-6.2-sol",
+            execute=True,
+        )
+        self.assertEqual(uncertain["status"], "blocked")
+        self.assertEqual(uncertain["block_reason"], "active_or_uncertain")
+
+        # 4) Stale earlier error entry followed by newer user turn ending in test failure -> rejected_non_provider
+        self.fake_orca.agent_reads["chat_real_err"] = {
+            "orcaSessionId": "chat_real_err",
+            "kind": "chat",
+            "agent": "codex",
+            "source": "chat",
+            "entries": [
+                {"kind": "message", "role": "user", "text": "Old turn"},
+                {"kind": "error", "text": "Codex couldn't finish this response. Open Details for more information."},
+                {"kind": "message", "role": "user", "text": "Re-run tests"},
+                {"kind": "message", "role": "assistant", "text": "pytest AssertionError: 3 tests failed"},
+            ],
+            "limited": False,
+            "state": "done",
+        }
+        non_prov = self.supervisor.recover(
+            kind="bot_chat",
+            role="implementation",
+            lane="premium",
+            bot="atlas-orchestrator",
+            chat_id="chat_real_err",
+            failed_provider="codex:gpt-6.2-sol",
+            execute=True,
+        )
+        self.assertEqual(non_prov["status"], "rejected_non_provider")
+
+        # 5) Real automation dispatching/dispatch_failed states and nested bot automation helpers
+        self.assertIn("dispatching", recovery.ACTIVE_RUN_STATES)
+        self.assertIn("dispatch_failed", recovery.SETTLED_FAILED_RUN_STATES)
+        self.assertIn("dispatch_failed", recovery.TERMINAL_FAILED_RUN_STATES)
+
+        nested_bot_auto = {
+            "id": "auto_nested_bot",
+            "agentId": "antigravity",
+            "bot": {
+                "botId": "bot-uuid-123",
+                "runsIn": "new",
+                "agentSetup": {"agent": "antigravity", "launch": {"model": "gemini-4-hydrogen-high"}},
+                "resultsTo": "chat",
+            },
+            "once": {"by": 1795597900173},
+            "rrule": None,
+            "enabled": False,
+        }
+        self.assertEqual(recovery._automation_bot_id(nested_bot_auto), "bot-uuid-123")
+        self.assertEqual(recovery._automation_results_to(nested_bot_auto), "chat")
+        self.assertEqual(recovery._automation_provider_key(nested_bot_auto), "antigravity:gemini-4-hydrogen-high")
 
 
 if __name__ == "__main__":

@@ -46,6 +46,8 @@ PROVIDER_ERRORS = (
     "provider error 5",
     "model not exist",
     "model_not_found",
+    "couldn't finish this response",
+    "couldn't respond because the service is busy",
 )
 HUMAN_WAIT_STATES = (
     "waiting",
@@ -244,6 +246,8 @@ def latest_turn_failure_text(read_result: dict) -> str:
     messages = transcript.get("messages")
     if not isinstance(messages, list):
         messages = read_result.get("messages")
+    if not isinstance(messages, list):
+        messages = read_result.get("entries")
     if not isinstance(messages, list) or not messages:
         err = read_result.get("error")
         return err if isinstance(err, str) else ""
@@ -257,7 +261,10 @@ def latest_turn_failure_text(read_result: dict) -> str:
         return ""
 
     assistant_msgs = [
-        m for m in turn_messages if str(m.get("role", "")).lower() in ("assistant", "bot", "error")
+        m
+        for m in turn_messages
+        if str(m.get("role", "")).lower() in ("assistant", "bot", "error")
+        or str(m.get("kind", "")).lower() == "error"
     ]
     if assistant_msgs:
         return "\n".join(_message_texts(assistant_msgs[-1]))
