@@ -21,8 +21,8 @@ uncertain live worker prevents fallback.
 - 120 locally available model routes matched OpenRouter entries.
 - 1,443 normalized public benchmark entries were collected.
 - Model variants and alternate providers are grouped in recommendation output.
-- Six unit tests cover score direction, provider/task failure distinction,
-  conservative model matching, and cooldown clearing.
+- Nine unit tests cover score direction, provider/task failure distinction,
+  conservative model matching, cooldown clearing, and cost/quality lane limits.
 - A real Orca/Luna supervised worker completed a read-only smoke task through
   the Python runner without repository edits.
 

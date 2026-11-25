@@ -13,7 +13,10 @@ import subprocess
 import tempfile
 from typing import Any
 
-from catalog import CATALOG_PATH, ROOT, SELECTION_PATH, atomic_json, load_json, load_selection
+from catalog import (
+    CATALOG_PATH, ROOT, SELECTION_PATH, atomic_json, comparison_price, load_json,
+    policy_exclusions, role_lane, selected_entries, set_selected_entries,
+)
 
 
 STATE_DIR = Path.home() / ".local" / "state" / "orca-fallback"
@@ -70,18 +73,7 @@ def performance() -> dict:
 
 
 def price_per_million(model: dict) -> float | None:
-    pricing = model.get("pricing", {})
-    costs = pricing.get("cost4", {})
-    input_price = costs.get("input")
-    output_price = costs.get("output")
-    if isinstance(input_price, (int, float)) and isinstance(output_price, (int, float)):
-        return 0.75 * input_price + 0.25 * output_price
-    openrouter = model.get("openrouter", {}).get("pricing_per_million", {})
-    input_price = openrouter.get("input")
-    output_price = openrouter.get("output")
-    if isinstance(input_price, (int, float)) and isinstance(output_price, (int, float)):
-        return 0.75 * input_price + 0.25 * output_price
-    return None
+    return comparison_price(model)
 
 
 def benchmark_scores(key: str, benchmarks: dict) -> tuple[dict, list[str]]:
@@ -114,11 +106,12 @@ def normalized(values: dict[str, float], *, lower_is_better: bool = False) -> di
     }
 
 
-def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
+def rank(role: str, provider: str | None = None, limit: int = 10, lane: str | None = None) -> dict:
     if role not in PROFILES:
         raise ValueError(f"Unsupported recommendation role: {role}")
     catalog = load_json(CATALOG_PATH)
     benchmarks = load_json(BENCHMARKS_PATH) if BENCHMARKS_PATH.exists() else {"entries": []}
+    lane_name, lane_config = role_lane(role, lane)
     measurements = performance()
     candidates = []
     for model in catalog["models"]:
@@ -127,6 +120,13 @@ def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
         if provider and model["provider"] != provider:
             continue
         scores, sources = benchmark_scores(model["key"], benchmarks)
+        exclusions = policy_exclusions(
+            model,
+            lane_config.get("budget", {}),
+            scores.get("artificial_analysis.intelligence_index"),
+        )
+        if exclusions:
+            continue
         candidates.append(
             {
                 "key": model["key"],
@@ -212,7 +212,7 @@ def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
         candidate["partial_score"] = round(sum(contributions.values()), 4)
         candidate["score_is_comparable"] = known_weight == 1.0
         candidate["unknown_metrics"] = unknown
-        candidate["current_selection_rank"] = current_rank(role, key)
+        candidate["current_selection_rank"] = current_rank(role, key, lane_name)
         ranked.append(candidate)
     ranked.sort(
         key=lambda c: (
@@ -243,6 +243,8 @@ def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
     )
     return {
         "role": role,
+        "lane": lane_name,
+        "budget": lane_config.get("budget", {}),
         "candidate_count": len(candidates),
         "model_group_count": len(groups),
         "ranking_policy": "Evidence coverage first, then partial score. Missing metrics never count as good scores.",
@@ -253,8 +255,7 @@ def rank(role: str, provider: str | None = None, limit: int = 10) -> dict:
 
 
 def ai_explain(result: dict, role: str) -> dict:
-    selection = load_selection()
-    orchestrator = selection["roles"]["orchestrator"][0]
+    orchestrator = selected_entries("orchestrator")[0]
     model_key = orchestrator["key"]
     if not model_key.startswith("codex:"):
         return {"error": "AI explanation currently requires a Codex orchestrator selection"}
@@ -311,9 +312,8 @@ def ai_explain(result: dict, role: str) -> dict:
     return answer
 
 
-def current_rank(role: str, key: str) -> int | None:
-    selection = load_selection()
-    keys = [entry["key"] for entry in selection["roles"].get(role, [])]
+def current_rank(role: str, key: str, lane: str | None = None) -> int | None:
+    keys = [entry["key"] for entry in selected_entries(role, lane)]
     return keys.index(key) + 1 if key in keys else None
 
 
@@ -321,22 +321,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=sorted(PROFILES), required=True)
     parser.add_argument("--provider")
+    parser.add_argument("--lane")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--format", choices=("json", "text"), default="text")
     parser.add_argument("--apply", action="store_true", help="Apply the displayed order after explicit user review")
     parser.add_argument("--ai", action="store_true", help="Ask the orchestrator model to explain the evidence")
     args = parser.parse_args()
-    result = rank(args.role, args.provider, max(1, min(args.limit, 50)))
+    result = rank(args.role, args.provider, max(1, min(args.limit, 50)), args.lane)
     if args.apply:
         selection = load_selection()
-        existing = {entry["key"]: entry for entry in selection["roles"].get(args.role, [])}
-        selection["roles"][args.role] = [
+        existing = {entry["key"]: entry for entry in selected_entries(args.role, args.lane)}
+        entries = [
             {
                 "key": candidate["key"],
                 **({"effort": existing[candidate["key"]]["effort"]} if candidate["key"] in existing and existing[candidate["key"]].get("effort") else {}),
             }
             for candidate in result["recommendations"][:3]
         ]
+        set_selected_entries(selection, args.role, args.lane, entries)
         atomic_json(SELECTION_PATH, selection)
         result["selection_changed"] = True
     if args.ai:

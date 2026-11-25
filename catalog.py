@@ -172,11 +172,59 @@ def discover_agy(executable: str) -> list[dict]:
 def unavailable_selections(catalog: dict, selection: dict) -> dict:
     available = {model["key"] for model in catalog["models"]}
     result = {}
-    for role, entries in selection.get("roles", {}).items():
+    for role, config in selection.get("roles", {}).items():
+        entries = config if isinstance(config, list) else [
+            entry for lane in config.get("lanes", {}).values() for entry in lane["models"]
+        ]
         missing = [entry["key"] for entry in entries if entry["key"] not in available]
         if missing:
             result[role] = missing
     return result
+
+
+def role_lane(role: str, lane: str | None = None) -> tuple[str, dict]:
+    config = load_selection()["roles"][role]
+    if isinstance(config, list):
+        return "legacy", {"models": config, "budget": {}, "allow_lane_escalation": False}
+    lane_name = lane or config.get("default_lane", "default")
+    try:
+        selected = config["lanes"][lane_name]
+    except KeyError as error:
+        raise ValueError(f"Unknown lane {lane_name} for {role}") from error
+    return lane_name, {
+        **selected,
+        "allow_lane_escalation": config.get("allow_lane_escalation", False),
+    }
+
+
+def comparison_price(model: dict) -> float | None:
+    costs = model.get("pricing", {}).get("cost4", {})
+    input_price, output_price = costs.get("input"), costs.get("output")
+    if isinstance(input_price, (int, float)) and isinstance(output_price, (int, float)):
+        return 0.75 * input_price + 0.25 * output_price
+    costs = model.get("openrouter", {}).get("pricing_per_million", {})
+    input_price, output_price = costs.get("input"), costs.get("output")
+    if isinstance(input_price, (int, float)) and isinstance(output_price, (int, float)):
+        return 0.75 * input_price + 0.25 * output_price
+    return None
+
+
+def policy_exclusions(model: dict, budget: dict, intelligence: float | None) -> list[str]:
+    reasons = []
+    maximum = budget.get("max_comparison_price_usd")
+    if maximum is not None:
+        price = comparison_price(model)
+        if price is None:
+            reasons.append("price_unknown")
+        elif price > maximum:
+            reasons.append(f"price_above_{maximum}")
+    minimum = budget.get("min_intelligence_index")
+    if minimum is not None:
+        if intelligence is None:
+            reasons.append("quality_unknown")
+        elif intelligence < minimum:
+            reasons.append(f"quality_below_{minimum}")
+    return reasons
 
 
 def refresh(quiet: bool = False) -> dict:
@@ -227,15 +275,20 @@ def refresh(quiet: bool = False) -> dict:
     return summary
 
 
-def resolve_providers(role: str) -> list[dict]:
+def resolve_policy(role: str, lane: str | None = None) -> tuple[list[dict], dict]:
     catalog = load_json(CATALOG_PATH)
-    selection = load_selection()
     models = {model["key"]: model for model in catalog["models"]}
-    try:
-        entries = selection["roles"][role]
-    except KeyError as error:
-        raise ValueError(f"Unknown or unconfigured role: {role}") from error
+    lane_name, lane_config = role_lane(role, lane)
+    entries = lane_config["models"]
+    benchmarks_path = ROOT / "benchmarks.json"
+    benchmarks = load_json(benchmarks_path) if benchmarks_path.exists() else {"entries": []}
+    intelligence = {
+        entry["model_key"]: entry["score"]
+        for entry in benchmarks["entries"]
+        if entry.get("benchmark") == "artificial_analysis.intelligence_index"
+    }
     providers = []
+    skipped = {}
     for entry in entries:
         key = entry["key"]
         if key not in models:
@@ -244,37 +297,67 @@ def resolve_providers(role: str) -> list[dict]:
                 "Refresh the catalog and choose a replacement; no automatic substitution was made."
             )
         model = models[key]
+        reasons = policy_exclusions(model, lane_config.get("budget", {}), intelligence.get(key))
+        if reasons:
+            skipped[key] = reasons
+            continue
         providers.append(
             {
                 "name": key,
                 "agent": model["agent"],
                 "model": model["model"],
+                "lane": lane_name,
                 **({"effort": entry["effort"]} if entry.get("effort") else {}),
             }
         )
+    report = {
+        "role": role,
+        "lane": lane_name,
+        "budget": lane_config.get("budget", {}),
+        "allow_lane_escalation": lane_config["allow_lane_escalation"],
+        "policy_skipped": skipped,
+    }
+    return providers, report
+
+
+def resolve_providers(role: str, lane: str | None = None) -> list[dict]:
+    providers, _ = resolve_policy(role, lane)
     if not providers:
-        raise ValueError(f"Role {role} has an empty fallback chain")
+        raise ValueError(f"Role {role} lane {lane or 'default'} has no eligible models")
     return providers
 
 
-def list_models(role: str | None) -> None:
+def selected_entries(role: str, lane: str | None = None) -> list[dict]:
+    _, config = role_lane(role, lane)
+    return config["models"]
+
+
+def set_selected_entries(selection: dict, role: str, lane: str | None, entries: list[dict]) -> None:
+    config = selection["roles"][role]
+    if isinstance(config, list):
+        selection["roles"][role] = entries
+    else:
+        lane_name = lane or config["default_lane"]
+        selection["roles"][role]["lanes"][lane_name]["models"] = entries
+
+
+def list_models(role: str | None, lane: str | None = None) -> None:
     catalog = load_json(CATALOG_PATH)
-    selection = load_selection()
     models = catalog["models"]
-    selected = {entry["key"] for entry in selection["roles"].get(role, [])} if role else set()
+    selected = {entry["key"] for entry in selected_entries(role, lane)} if role else set()
     for index, model in enumerate(models, 1):
         marker = "*" if model["key"] in selected else " "
         health = "" if model.get("available", True) else "  [unavailable]"
         print(f"{index:3} {marker} {model['key']}  [{model['label']}]{health}")
     if role:
-        chain = selection["roles"].get(role, [])
-        print("\nSelected fallback order:")
+        chain = selected_entries(role, lane)
+        print(f"\nSelected fallback order ({lane or role_lane(role)[0]}):")
         for index, entry in enumerate(chain, 1):
             effort = f" effort={entry['effort']}" if entry.get("effort") else ""
             print(f"  {index}. {entry['key']}{effort}")
 
 
-def select(role: str, keys: list[str]) -> None:
+def select(role: str, keys: list[str], lane: str | None = None) -> None:
     catalog = load_json(CATALOG_PATH)
     selection = load_selection()
     available = {model["key"]: model for model in catalog["models"]}
@@ -293,7 +376,7 @@ def select(role: str, keys: list[str]) -> None:
         entries.append({"key": key, **({"effort": effort} if separator else {})})
     if not entries:
         raise ValueError("Choose at least one model")
-    selection["roles"][role] = entries
+    set_selected_entries(selection, role, lane, entries)
     atomic_json(SELECTION_PATH, selection)
     print(json.dumps({role: entries}, indent=2, ensure_ascii=False))
 
@@ -305,17 +388,19 @@ def main() -> int:
     refresh_parser.add_argument("--quiet", action="store_true")
     list_parser = commands.add_parser("list")
     list_parser.add_argument("--role")
+    list_parser.add_argument("--lane")
     select_parser = commands.add_parser("select")
     select_parser.add_argument("--role", required=True)
+    select_parser.add_argument("--lane")
     select_parser.add_argument("--models", nargs="+", required=True)
     args = parser.parse_args()
     try:
         if args.command == "refresh":
             refresh(args.quiet)
         elif args.command == "list":
-            list_models(args.role)
+            list_models(args.role, args.lane)
         else:
-            select(args.role, args.models)
+            select(args.role, args.models, args.lane)
     except Exception as error:
         parser.exit(1, f"error: {error}\n")
     return 0

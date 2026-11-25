@@ -15,7 +15,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
-from catalog import SETTINGS, resolve_providers
+from catalog import SETTINGS, resolve_policy
 
 
 ROOT = Path(__file__).resolve().parent
@@ -182,9 +182,9 @@ def wait_for_worker(orca: Orca, dispatch: str, poll: int, timeout: int) -> dict:
 
 def run_job(args: argparse.Namespace) -> dict:
     config = SETTINGS
-    providers = resolve_providers(args.role)
+    providers, policy = resolve_policy(args.role, args.lane)
     if not providers:
-        raise ValueError("At least one provider is required")
+        raise ValueError("No models satisfy this role and lane policy")
     worktree = args.worktree.resolve()
     spec_file = args.spec_file.resolve()
     if not worktree.is_dir() or not spec_file.is_file():
@@ -202,6 +202,8 @@ def run_job(args: argparse.Namespace) -> dict:
         "worktree": str(worktree),
         "spec_file": str(spec_file),
         "role": args.role,
+        "lane": policy["lane"],
+        "policy": policy,
         "started_at": now(),
         "attempts": [],
         "status": "starting",
@@ -338,7 +340,11 @@ def run_job(args: argparse.Namespace) -> dict:
                 config.get("provider_cooldown_seconds", 900),
             )
 
-        state.update(status="all_providers_failed", finished_at=now())
+        state.update(
+            status="lane_exhausted",
+            escalation_required=not policy["allow_lane_escalation"],
+            finished_at=now(),
+        )
         write_state(state_path, state)
         return state
     except Exception as error:
@@ -359,6 +365,7 @@ def main() -> int:
     parser.add_argument("--spec-file", type=Path, required=True)
     parser.add_argument("--title", required=True)
     parser.add_argument("--role", default="implementation")
+    parser.add_argument("--lane")
     args = parser.parse_args()
     try:
         result = run_job(args)

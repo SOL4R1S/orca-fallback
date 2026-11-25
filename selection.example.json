@@ -1,30 +1,230 @@
 {
-  "version": 1,
+  "version": 2,
   "roles": {
-    "orchestrator": [
-      {"key": "codex:gpt-6.2-sol", "effort": "high"},
-      {"key": "antigravity:gemini-4-hydrogen-high"},
-      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"}
-    ],
-    "implementation": [
-      {"key": "codex:gpt-6.2-sol", "effort": "high"},
-      {"key": "antigravity:gemini-4-hydrogen-high"},
-      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"}
-    ],
-    "review": [
-      {"key": "antigravity:gemini-4-hydrogen-high"},
-      {"key": "codex:gpt-6.2-sol", "effort": "high"},
-      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"}
-    ],
-    "documentation": [
-      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"},
-      {"key": "codex:gpt-6-luna", "effort": "low"},
-      {"key": "antigravity:gemini-4-hydrogen-high"}
-    ],
-    "research": [
-      {"key": "codex:gpt-6-luna", "effort": "medium"},
-      {"key": "antigravity:gemini-4-hydrogen-high"},
-      {"key": "codex:command-code/z-ai/glm-5.3-flash", "effort": "low"}
-    ]
+    "orchestrator": {
+      "default_lane": "premium",
+      "allow_lane_escalation": false,
+      "lanes": {
+        "premium": {
+          "budget": {
+            "max_comparison_price_usd": 8,
+            "min_intelligence_index": 40
+          },
+          "models": [
+            {
+              "key": "codex:gpt-6.2-sol",
+              "effort": "high"
+            },
+            {
+              "key": "antigravity:gemini-4-hydrogen-high"
+            },
+            {
+              "key": "codex:kimi-code/k3.1-pro",
+              "effort": "high"
+            }
+          ]
+        },
+        "economy": {
+          "budget": {
+            "max_comparison_price_usd": 1,
+            "min_intelligence_index": 20
+          },
+          "models": [
+            {
+              "key": "codex:gpt-6-luna",
+              "effort": "low"
+            },
+            {
+              "key": "codex:command-code/z-ai/glm-5.3-flash",
+              "effort": "low"
+            },
+            {
+              "key": "codex:alibaba-token-plan-sg/deepseek-v4.1-flash-1017",
+              "effort": "low"
+            }
+          ]
+        }
+      }
+    },
+    "implementation": {
+      "default_lane": "premium",
+      "allow_lane_escalation": false,
+      "lanes": {
+        "premium": {
+          "budget": {
+            "max_comparison_price_usd": 8,
+            "min_intelligence_index": 40
+          },
+          "models": [
+            {
+              "key": "codex:gpt-6.2-sol",
+              "effort": "high"
+            },
+            {
+              "key": "antigravity:gemini-4-hydrogen-high"
+            },
+            {
+              "key": "codex:kimi-code/k3.1-pro",
+              "effort": "high"
+            }
+          ]
+        },
+        "economy": {
+          "budget": {
+            "max_comparison_price_usd": 1,
+            "min_intelligence_index": 20
+          },
+          "models": [
+            {
+              "key": "codex:gpt-6-luna",
+              "effort": "low"
+            },
+            {
+              "key": "codex:command-code/z-ai/glm-5.3-flash",
+              "effort": "low"
+            },
+            {
+              "key": "codex:alibaba-token-plan-sg/deepseek-v4.1-flash-1017",
+              "effort": "low"
+            }
+          ]
+        }
+      }
+    },
+    "review": {
+      "default_lane": "premium",
+      "allow_lane_escalation": false,
+      "lanes": {
+        "premium": {
+          "budget": {
+            "max_comparison_price_usd": 8,
+            "min_intelligence_index": 40
+          },
+          "models": [
+            {
+              "key": "antigravity:gemini-4-hydrogen-high"
+            },
+            {
+              "key": "codex:gpt-6.2-sol",
+              "effort": "high"
+            },
+            {
+              "key": "codex:kimi-code/k3.1-pro",
+              "effort": "high"
+            }
+          ]
+        },
+        "economy": {
+          "budget": {
+            "max_comparison_price_usd": 1,
+            "min_intelligence_index": 20
+          },
+          "models": [
+            {
+              "key": "codex:gpt-6-luna",
+              "effort": "low"
+            },
+            {
+              "key": "codex:command-code/z-ai/glm-5.3-flash",
+              "effort": "low"
+            },
+            {
+              "key": "codex:alibaba-token-plan-sg/deepseek-v4.1-flash-1017",
+              "effort": "low"
+            }
+          ]
+        }
+      }
+    },
+    "documentation": {
+      "default_lane": "economy",
+      "allow_lane_escalation": false,
+      "lanes": {
+        "premium": {
+          "budget": {
+            "max_comparison_price_usd": 8,
+            "min_intelligence_index": 40
+          },
+          "models": [
+            {
+              "key": "codex:gpt-6.2-sol",
+              "effort": "high"
+            },
+            {
+              "key": "antigravity:gemini-4-hydrogen-high"
+            },
+            {
+              "key": "codex:kimi-code/k3.1-pro",
+              "effort": "high"
+            }
+          ]
+        },
+        "economy": {
+          "budget": {
+            "max_comparison_price_usd": 1,
+            "min_intelligence_index": 20
+          },
+          "models": [
+            {
+              "key": "codex:command-code/z-ai/glm-5.3-flash",
+              "effort": "low"
+            },
+            {
+              "key": "codex:gpt-6-luna",
+              "effort": "low"
+            },
+            {
+              "key": "codex:alibaba-token-plan-sg/deepseek-v4.1-flash-1017",
+              "effort": "low"
+            }
+          ]
+        }
+      }
+    },
+    "research": {
+      "default_lane": "economy",
+      "allow_lane_escalation": false,
+      "lanes": {
+        "premium": {
+          "budget": {
+            "max_comparison_price_usd": 8,
+            "min_intelligence_index": 40
+          },
+          "models": [
+            {
+              "key": "codex:gpt-6.2-sol",
+              "effort": "high"
+            },
+            {
+              "key": "antigravity:gemini-4-hydrogen-high"
+            },
+            {
+              "key": "codex:kimi-code/k3.1-pro",
+              "effort": "high"
+            }
+          ]
+        },
+        "economy": {
+          "budget": {
+            "max_comparison_price_usd": 1,
+            "min_intelligence_index": 20
+          },
+          "models": [
+            {
+              "key": "codex:gpt-6-luna",
+              "effort": "low"
+            },
+            {
+              "key": "codex:command-code/z-ai/glm-5.3-flash",
+              "effort": "low"
+            },
+            {
+              "key": "codex:alibaba-token-plan-sg/deepseek-v4.1-flash-1017",
+              "effort": "low"
+            }
+          ]
+        }
+      }
+    }
   }
 }

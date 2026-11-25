@@ -71,6 +71,27 @@ Roles are `orchestrator`, `implementation`, `review`, `documentation`, and
 lives in `catalog.json`. A selected model that disappears blocks the next run
 until the user chooses a replacement.
 
+### Cost and quality lanes
+
+Each role has `premium` and `economy` lanes with independent fallback orders,
+absolute comparison-price ceilings, and minimum intelligence scores. Economy
+does not escalate to premium automatically. Exhausting every eligible model
+returns `lane_exhausted`; the user must explicitly rerun with `--lane premium`
+to approve a more expensive attempt.
+
+```sh
+python3 run.py --worktree /path/to/repo --title 'Summarize sources' \
+  --spec-file /path/to/task.md --role research --lane economy
+python3 catalog.py list --role research --lane economy
+python3 catalog.py select --role research --lane economy \
+  --models codex:gpt-6-luna=low \
+           codex:command-code/z-ai/glm-5.3-flash=low \
+           codex:alibaba-token-plan-sg/deepseek-v4.1-flash-1017=low
+```
+
+Missing price or quality evidence does not bypass these limits. Legacy role
+arrays remain supported for existing configurations.
+
 The included `units/orca-model-catalog.timer` refreshes this inventory every
 six hours. It updates only `catalog.json`, never the user's selections.
 
