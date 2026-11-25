@@ -663,6 +663,40 @@ def run_isolated_e2e() -> dict[str, Any]:
             except subprocess.TimeoutExpired:
                 serve_proc.kill()
                 serve_proc.communicate()
+            # Also terminate any detached orcad daemon / terminal children scoped to this temp root
+            root_str = str(root)
+            my_pid = os.getpid()
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                if pid == my_pid:
+                    continue
+                try:
+                    cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "ignore")
+                except OSError:
+                    continue
+                if root_str in cmdline:
+                    try:
+                        os.kill(pid, 15)
+                    except OSError:
+                        pass
+            time.sleep(0.5)
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                if pid == my_pid:
+                    continue
+                try:
+                    cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "ignore")
+                except OSError:
+                    continue
+                if root_str in cmdline:
+                    try:
+                        os.kill(pid, 9)
+                    except OSError:
+                        pass
             report["cleanup"]["serve_stopped"] = True
             report["cleanup"]["temp_dir_removed_on_exit"] = str(root)
 
