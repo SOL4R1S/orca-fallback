@@ -73,8 +73,32 @@ deployed against the live Atlas bot or any production automation.
 
 ## Operational scope notes
 
-- **Background scheduler/poller**: No permanent daemon or timer is installed;
-  `reconcile` and `resume` remain explicit invocations.
+- **Native Orca boundary**: Headless `orca-serve` does not expose a plugin hook
+  service (`Plugin service is not available on this runtime`), and Orca native
+  automations always launch an LLM agent (`--provider` or `--bot` with
+  `--prompt`) with no supported command-only deterministic execution mode
+  (`--precheck` is only a schedule preflight gate). `wiring.py` +
+  `mcp_dispatch.py` wire delegated work via supported `bot tools add`, short
+  `SOUL.md` guidance, and reversible automation prompt blocks; prompt guidance is
+  not a hard interposer. For deterministic local worktree schedules, `wiring.py`
+  also provides opt-in `install-scheduled-dispatch` systemd user units.
+- **Unattended opt-in & post-cooldown safety**: `recovery.py supervise` requires
+  `supervision_schema_version: 2` + `unattended_supervision: true` (skipping
+  historical JSON records of the same shape and `--no-unattended` opt-outs) and
+  filters pre-enrollment automation runs via `enrolled_at` + `baseline_run_ids`.
+  Post-cooldown retry after all candidates hit rate limit preserves
+  `excluded_providers`, permits at most one post-cooldown attempt after an exact
+  `OK` probe in the same lane only when failures are proven pre-work and
+  transient, and blocks credentials/`model_not_found`/side-effecting failures.
+- **Background scheduler/poller**: `units/orca-recovery-supervisor.service` and
+  `units/orca-recovery-supervisor.timer` (`OnUnitInactiveSec=1min` after exit)
+  provide an opt-in systemd user oneshot supervisor (`recovery.py supervise --execute`)
+  for automatic reconciliation and health-gated delayed resume; units are
+  validated with `systemd-analyze --user verify` and not auto-enabled in production
+  by default.
 - **Production deployment**: All validation ran strictly against isolated
   temporary runtimes (`ORCA_USER_DATA_PATH` under `/tmp`, loopback `127.0.0.1`);
-  production Atlas bots and automations were never modified.
+  production Atlas bots and automations were never modified. The full isolated
+  live E2E (`scripts/e2e_isolated.py`) was run on the initial implementation;
+  subsequent rollout-blocker fixes were verified via unit tests, compile checks,
+  and `systemd-analyze --user verify`.

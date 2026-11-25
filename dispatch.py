@@ -80,6 +80,7 @@ def dispatch_task(
     item_id: str | None = None,
     preferred_provider: str | None = None,
     skip_providers: set[str] | None = None,
+    unattended: bool = True,
     dry_run: bool = False,
     orca: run.Orca | None = None,
     state_dir: Path | None = None,
@@ -119,6 +120,8 @@ def dispatch_task(
 
     record: dict[str, Any] = {
         "handoff_id": handoff_id,
+        "supervision_schema_version": run.SUPERVISION_SCHEMA_VERSION,
+        "unattended_supervision": bool(unattended),
         "created_at": run.now(),
         "updated_at": run.now(),
         "mode": "dry_run" if dry_run else "execute",
@@ -127,6 +130,7 @@ def dispatch_task(
         "role": role,
         "lane": selection_info["lane"],
         "preferred_provider": selection_info["preferred_provider"],
+        "excluded_providers": sorted(set(skip_providers or ())),
         "actual_provider": next_provider["name"] if (dry_run and next_provider) else None,
         "returned_to_preferred": selection_info["returned_to_preferred"] if dry_run else False,
         "mid_task_switch_allowed": False,
@@ -212,7 +216,9 @@ def dispatch_task(
     executed_attempts = [a for a in attempts if "dispatch_id" in a]
     last_executed = executed_attempts[-1] if executed_attempts else None
     actual_provider = result.get("selected_provider") or (
-        last_executed.get("provider") if last_executed else None
+        last_executed.get("provider")
+        if (last_executed and result.get("status") == "succeeded")
+        else None
     )
     record["status"] = result.get("status", "unknown")
     record["actual_provider"] = actual_provider
@@ -253,6 +259,30 @@ def dispatch_task(
         }
     )
     run.write_state(handoff_path, record)
+
+    if record["status"] == "lane_exhausted":
+        import recovery
+
+        supervisor = recovery.RecoverySupervisor(
+            adapter=recovery.OrcaRecoveryAdapter(orca=orca),
+            state_dir=effective_state_dir,
+        )
+        rec = supervisor.register_dispatch_exhausted(record, execute=True, unattended=unattended)
+        if rec is not None:
+            record["recovery_id"] = rec.get("recovery_id")
+            record["recovery_status"] = rec.get("status")
+            record["delayed_resume_plan"] = rec.get("delayed_resume_plan")
+            record["updated_at"] = run.now()
+            record["history"].append(
+                {
+                    "at": run.now(),
+                    "event": "durable_recovery_registered",
+                    "status": rec.get("status"),
+                    "detail": {"recovery_id": rec.get("recovery_id")},
+                }
+            )
+            run.write_state(handoff_path, record)
+
     return run.redact_secrets(record)
 
 
@@ -275,6 +305,8 @@ def main() -> int:
     parser.add_argument("--run-id")
     parser.add_argument("--item-id")
     parser.add_argument("--preferred-provider")
+    parser.add_argument("--skip-provider", nargs="*", default=None)
+    parser.add_argument("--no-unattended", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
@@ -292,6 +324,8 @@ def main() -> int:
             run_id=args.run_id,
             item_id=args.item_id,
             preferred_provider=args.preferred_provider,
+            skip_providers=set(args.skip_provider) if args.skip_provider else None,
+            unattended=not args.no_unattended,
             dry_run=args.dry_run,
         )
     except Exception as error:

@@ -280,7 +280,8 @@ def resolve_policy(role: str, lane: str | None = None) -> tuple[list[dict], dict
     models = {model["key"]: model for model in catalog["models"]}
     lane_name, lane_config = role_lane(role, lane)
     entries = lane_config["models"]
-    benchmarks_path = ROOT / "benchmarks.json"
+    benchmarks_setting = SETTINGS.get("benchmarks")
+    benchmarks_path = configured_path(benchmarks_setting) if benchmarks_setting else (ROOT / "benchmarks.json")
     benchmarks = load_json(benchmarks_path) if benchmarks_path.exists() else {"entries": []}
     intelligence = {
         entry["model_key"]: entry["score"]

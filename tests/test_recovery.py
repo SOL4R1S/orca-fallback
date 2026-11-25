@@ -662,14 +662,14 @@ class RecoveryAndDispatchTests(unittest.TestCase):
             chat_id="chat_dry_res",
             assistant_error="usage limit",
         )
+        run.update_cooldown(self.state_dir / "cooldowns.json", "codex:command-code/z-ai/glm-5.3-flash", 60)
         dry_plan = self.supervisor.recover(
             kind="bot_chat",
             role="implementation",
             lane="economy",
             bot="atlas-orchestrator",
             chat_id="chat_dry_res",
-            failed_provider="codex:command-code/z-ai/glm-5.3-flash",
-            prior_attempted=["codex:gpt-6-luna"],
+            failed_provider="codex:gpt-6-luna",
             execute=False,
         )
         self.assertEqual(dry_plan["status"], "dry_run_exhausted_delayed_resume")
@@ -677,7 +677,6 @@ class RecoveryAndDispatchTests(unittest.TestCase):
             self.supervisor.resume_after_probe(dry_plan["recovery_id"], execute=True, now_ts=time.time() + 3600)
 
         # Live exhausted plan, but original chat becomes working before resume -> blocks!
-        run.update_cooldown(self.state_dir / "cooldowns.json", "codex:command-code/z-ai/glm-5.3-flash", 60)
         live_plan = self.supervisor.recover(
             kind="bot_chat",
             role="implementation",

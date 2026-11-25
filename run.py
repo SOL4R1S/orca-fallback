@@ -20,6 +20,7 @@ from catalog import SETTINGS, resolve_policy
 
 
 ROOT = Path(__file__).resolve().parent
+SUPERVISION_SCHEMA_VERSION = 2
 STATE_DIR = Path(
     os.environ.get(
         "ORCA_FALLBACK_STATE_DIR", Path.home() / ".local" / "state" / "orca-fallback"
@@ -48,6 +49,31 @@ PROVIDER_ERRORS = (
     "model_not_found",
     "couldn't finish this response",
     "couldn't respond because the service is busy",
+)
+NON_RETRYABLE_PROVIDER_ERRORS = (
+    "invalid_api_key",
+    "authentication_error",
+    "authentication timed out",
+    "provider rejected the configured credentials",
+    "invalid credentials",
+    "unauthorized",
+    "model not exist",
+    "model_not_found",
+    "unknown model",
+    "provider error 400",
+    "provider error 401",
+    "provider error 403",
+    "provider error 404",
+    "404 not found",
+)
+NON_RETRYABLE_ERROR_CODES = frozenset(
+    {
+        "invalid_api_key",
+        "authentication_error",
+        "model_not_found",
+        "unauthorized",
+        "forbidden",
+    }
 )
 HUMAN_WAIT_STATES = (
     "waiting",
@@ -333,6 +359,117 @@ def classify_worker_failure(status_record: dict[str, Any] | None, text: str = ""
     }
 
 
+def is_retryable_provider_failure(status_record: dict[str, Any] | None, text: str = "") -> bool:
+    """Return True only for transient provider failures (never auth/credentials or model-not-found)."""
+    record = status_record or {}
+    if not classify_worker_failure(record, text)["eligible_for_fallback"]:
+        return False
+    error_code = str(record.get("errorCode") or record.get("failureType") or "").lower()
+    if error_code in NON_RETRYABLE_ERROR_CODES:
+        return False
+    parts = [text]
+    for field in ("error", "lastError", "failureReason", "message"):
+        val = record.get(field)
+        if isinstance(val, str) and val:
+            parts.append(val)
+    snapshot = record.get("outputSnapshot")
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("content"), str):
+        parts.append(snapshot["content"])
+    lowered = "\n".join(parts).lower()
+    return not any(pattern in lowered for pattern in NON_RETRYABLE_PROVIDER_ERRORS)
+
+
+def transcript_proves_pre_work_failure(
+    read_result: dict[str, Any] | None,
+    status_record: dict[str, Any] | None = None,
+    *,
+    latest_turn_only: bool = False,
+) -> tuple[bool, str]:
+    """Verify from transcript/status evidence that failure occurred before tool calls or work."""
+    record = status_record or {}
+    for field in ("sideEffects", "modifiedFiles", "commits", "toolCalls", "tool_calls"):
+        if record.get(field):
+            return False, f"side_effects_on_status:{field}"
+
+    payload = read_result if isinstance(read_result, dict) else {}
+    transcript = payload.get("transcript") if isinstance(payload.get("transcript"), dict) else {}
+    messages = transcript.get("messages")
+    if not isinstance(messages, list):
+        messages = payload.get("messages")
+    if not isinstance(messages, list):
+        messages = payload.get("entries")
+
+    if not isinstance(messages, list) or not messages:
+        run_status = str(record.get("status") or record.get("state") or "").lower()
+        if run_status == "dispatch_failed":
+            return True, "dispatch_failed_before_start"
+        return False, "missing_transcript_evidence"
+
+    relevant: list[Any] = list(messages)
+    if latest_turn_only:
+        last_user_idx = -1
+        for idx, msg in enumerate(relevant):
+            if isinstance(msg, dict) and str(msg.get("role", "")).lower() == "user":
+                last_user_idx = idx
+        relevant = relevant[last_user_idx + 1 :]
+
+    response_entries = 0
+    for msg in relevant:
+        if not isinstance(msg, dict):
+            return False, "unexpected_transcript_entry"
+        role = str(msg.get("role") or "").lower()
+        kind = str(msg.get("kind") or "").lower()
+        msg_type = str(msg.get("type") or "").lower()
+        if (
+            role in ("tool", "tool_result", "tool_call", "function")
+            or kind in ("tool", "tool_call", "tool_result", "command", "file_change", "mcp_call", "tool_use")
+            or msg_type in ("tool_use", "tool_call", "tool_result", "command_execution", "file_change")
+        ):
+            return False, "tool_activity_observed"
+        for key in ("toolCalls", "tool_calls", "toolUse", "tool_use", "functionCall", "function_call"):
+            if msg.get(key):
+                return False, f"tool_field_observed:{key}"
+        for container_key in ("blocks", "content"):
+            items = msg.get(container_key)
+            if isinstance(items, list):
+                for block in items:
+                    if isinstance(block, dict) and str(block.get("type") or "").lower() in (
+                        "tool_use",
+                        "tool_call",
+                        "tool_result",
+                        "command_execution",
+                        "file_change",
+                        "mcp_tool_use",
+                        "mcp_tool_result",
+                    ):
+                        return False, "tool_block_observed"
+        if role in ("assistant", "bot", "error") or kind == "error":
+            response_entries += 1
+
+    if response_entries == 0:
+        return False, "missing_failure_entry"
+    if response_entries > 1:
+        return False, "multiple_response_turns_observed"
+    return True, "pre_work_transcript_verified"
+
+
+def _git_status_snapshot(worktree: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout
+
+
 def worker_is_settled(show: dict) -> bool:
     return show.get("stage") == "settled" and (
         show.get("liveness") in ("exited", "dead")
@@ -433,6 +570,7 @@ def run_job(
         "lane": policy["lane"],
         "policy": policy,
         "preferred_provider": providers[0]["name"],
+        "excluded_providers": sorted(set(skip_providers or ())),
         "started_at": now(),
         "attempts": [],
         "status": "starting",
@@ -493,6 +631,7 @@ def run_job(
                 write_state(state_path, state)
                 continue
             attempted.add(provider["name"])
+            git_baseline = _git_status_snapshot(worktree)
             attempt = {
                 "provider": provider["name"],
                 "agent": provider["agent"],
@@ -585,8 +724,21 @@ def run_job(
             )
             error_text = latest_turn_failure_text(read_result)
             classification = classify_worker_failure(show, error_text)
+            pre_work_ok, pre_work_reason = transcript_proves_pre_work_failure(
+                read_result, show, latest_turn_only=False
+            )
+            if pre_work_ok and git_baseline is not None:
+                git_after = _git_status_snapshot(worktree)
+                if git_after is None or git_after != git_baseline:
+                    pre_work_ok = False
+                    pre_work_reason = "worktree_modified_during_attempt"
             attempt["human_input_wait"] = classification["classification"] == "human_input_wait"
             attempt["provider_failure"] = classification["eligible_for_fallback"]
+            attempt["retryable_provider_failure"] = bool(
+                attempt["provider_failure"] and is_retryable_provider_failure(show, error_text)
+            )
+            attempt["pre_work_proven"] = pre_work_ok
+            attempt["pre_work_reason"] = pre_work_reason
             attempt["classification"] = classification
             attempt["error_excerpt"] = redact_text(error_text)[-2000:]
             attempt["latency_seconds"] = round(time.monotonic() - attempt_started, 3)

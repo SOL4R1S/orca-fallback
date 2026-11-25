@@ -66,6 +66,7 @@ RECEIPT_ALLOWLIST_KEYS = (
     "error",
 )
 RECOVERY_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+HANDOFF_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
 HEALTH_PROBE_PROMPT = "Reply with exact text OK and nothing else."
 EXTRA_MODEL_RE = re.compile(r"(?:--model|-m)(?:\s+|=)([^\s'\"]+)")
 TUI_PROVIDER_ERROR_MARKERS = ("unexpected status", "provider error")
@@ -77,6 +78,9 @@ def _recovery_settings() -> dict[str, Any]:
         "return_to_preferred_on_next_task": True,
         "delayed_resume_delay_seconds": SETTINGS.get("provider_cooldown_seconds", 900),
         "health_probe_timeout_seconds": 30,
+        "max_probe_attempts": 3,
+        "max_resume_attempts": 3,
+        "max_supervise_actions": 20,
         "bots_dir": "~/.orca/bots",
         "once_deadline_seconds": 300,
     }
@@ -88,6 +92,56 @@ def _recovery_settings() -> dict[str, Any]:
 
 def _parse_iso(value: str) -> float:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def _parse_timestamp(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        num = float(value)
+        return num / 1000.0 if abs(num) > 1e12 else num
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return _parse_iso(text)
+        except ValueError:
+            try:
+                num = float(text)
+                return num / 1000.0 if abs(num) > 1e12 else num
+            except ValueError:
+                return None
+    return None
+
+
+def _run_pre_enrollment_reason(target_run: dict[str, Any] | None, enrollment: dict[str, Any]) -> str | None:
+    if not isinstance(target_run, dict):
+        return "missing_target_run"
+    run_id = str(target_run.get("id") or "")
+    baseline_ids = enrollment.get("baseline_run_ids")
+    if isinstance(baseline_ids, list) and run_id in {str(x) for x in baseline_ids}:
+        return "pre_enrollment_baseline_run"
+    enrolled_ts = _parse_timestamp(enrollment.get("enrolled_at") or enrollment.get("updated_at"))
+    if enrolled_ts is None:
+        return "invalid_enrollment_timestamp"
+    start_ts = next(
+        (ts for key in ("startedAt", "createdAt", "scheduledAt", "scheduledFor") if (ts := _parse_timestamp(target_run.get(key))) is not None),
+        None,
+    )
+    end_ts = next(
+        (ts for key in ("finishedAt", "completedAt", "updatedAt") if (ts := _parse_timestamp(target_run.get(key))) is not None),
+        None,
+    )
+    if start_ts is not None:
+        if start_ts < enrolled_ts:
+            return "pre_enrollment_run_timestamp"
+    elif end_ts is not None:
+        if end_ts < enrolled_ts:
+            return "pre_enrollment_run_timestamp"
+    elif not isinstance(baseline_ids, list):
+        return "unverified_run_timestamp_pre_enrollment"
+    return None
 
 
 def _iso_from_ts(ts: float) -> str:
@@ -260,7 +314,12 @@ def _extract_latest_bot_user_ask(read_payload: dict[str, Any]) -> str | None:
 
 
 def _has_side_effect_or_claim(record: dict[str, Any]) -> bool:
-    if record.get("mutations") or record.get("external_action_receipts") or record.get("launch_intent"):
+    if (
+        record.get("mutations")
+        or record.get("external_action_receipts")
+        or record.get("launch_intent")
+        or record.get("user_decision_required")
+    ):
         return True
     return record.get("status") in (
         "in_progress",
@@ -308,6 +367,18 @@ class OrcaRecoveryAdapter:
 
     def bot_chats(self, bot: str) -> dict[str, Any]:
         return self.orca.call("bot", "chats", "--bot", bot, "--all")
+
+    def bot_tools(self, bot: str) -> dict[str, Any]:
+        return self.orca.call("bot", "tools", "--bot", bot)
+
+    def bot_tools_add(self, bot: str, source: str, *, name: str | None = None) -> dict[str, Any]:
+        args = ["bot", "tools", "add", source, "--bot", bot]
+        if name:
+            args.extend(["--name", name])
+        return self.orca.call(*args)
+
+    def bot_tools_rm(self, bot: str, name: str) -> dict[str, Any]:
+        return self.orca.call("bot", "tools", "rm", name, "--bot", bot)
 
     def agent_show(self, session_id: str) -> dict[str, Any]:
         arg = session_id if session_id.startswith("orca_session_id:") else f"orca_session_id:{session_id}"
@@ -665,6 +736,7 @@ class RecoverySupervisor:
         role: str,
         lane: str,
         attempted: list[str],
+        excluded_providers: list[str] | set[str] | None = None,
         preferred_provider: str | None,
         at_ts: float | None = None,
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
@@ -672,6 +744,7 @@ class RecoverySupervisor:
         if not providers:
             raise ValueError(f"No models satisfy role={role!r} lane={lane!r}")
         attempted_set = set(attempted)
+        excluded_set = set(excluded_providers or ())
         cooldowns: dict[str, Any] = {}
         next_provider = None
         for provider in providers:
@@ -682,13 +755,193 @@ class RecoverySupervisor:
                     "remaining_seconds": remaining,
                     "reset_at": run.cooldown_reset_at(self.cooldown_path, key, at_ts=at_ts),
                 }
-            if next_provider is None and key not in attempted_set and remaining == 0:
+            if next_provider is None and key not in attempted_set and key not in excluded_set and remaining == 0:
                 next_provider = provider
         if preferred_provider is None:
             preferred_provider = providers[0]["name"]
         return next_provider, providers, policy, {
             "preferred_provider": preferred_provider,
             "cooldowns": cooldowns,
+        }
+
+    def _load_dispatch_audit(self, handoff_id: str) -> dict[str, Any] | None:
+        if not handoff_id or not HANDOFF_ID_RE.fullmatch(handoff_id):
+            return None
+        path = self.state_dir / "dispatches" / f"{handoff_id}.json"
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) and data.get("handoff_id") == handoff_id else None
+
+    def _verify_dispatch_record(self, dispatch_rec: dict[str, Any] | None, handoff_id: str | None) -> dict[str, Any]:
+        if not handoff_id or not HANDOFF_ID_RE.fullmatch(handoff_id):
+            return {"settled": False, "reason": "invalid_or_missing_handoff_id", "evidence": {}}
+        if dispatch_rec is None:
+            dispatch_rec = self._load_dispatch_audit(handoff_id)
+        if not isinstance(dispatch_rec, dict) or dispatch_rec.get("handoff_id") != handoff_id:
+            return {
+                "settled": False,
+                "reason": "dispatch_record_missing",
+                "evidence": {},
+                "canonical_key": f"canonical:dispatch:{handoff_id}",
+            }
+        canonical_key = f"canonical:dispatch:{handoff_id}"
+        if dispatch_rec.get("mode") != "execute":
+            return {
+                "settled": False,
+                "reason": "dispatch_not_execute_mode",
+                "evidence": {"mode": dispatch_rec.get("mode")},
+                "canonical_key": canonical_key,
+            }
+        if dispatch_rec.get("status") != "lane_exhausted":
+            return {
+                "settled": False,
+                "reason": "dispatch_not_lane_exhausted",
+                "evidence": {"status": dispatch_rec.get("status")},
+                "canonical_key": canonical_key,
+            }
+        role = dispatch_rec.get("role")
+        lane = dispatch_rec.get("lane")
+        worktree = dispatch_rec.get("worktree")
+        spec_file = dispatch_rec.get("spec_file")
+        title = dispatch_rec.get("title")
+        if (
+            not isinstance(role, str)
+            or not role.strip()
+            or not isinstance(lane, str)
+            or not lane.strip()
+            or not isinstance(title, str)
+            or not title.strip()
+            or not isinstance(worktree, str)
+            or not Path(worktree).is_dir()
+            or not isinstance(spec_file, str)
+            or not Path(spec_file).is_file()
+            or not Path(spec_file).read_text(encoding="utf-8").strip()
+        ):
+            return {
+                "settled": False,
+                "reason": "unsafe_or_legacy_dispatch_record",
+                "evidence": {"handoff_id": handoff_id},
+                "canonical_key": canonical_key,
+            }
+        attempts = (dispatch_rec.get("verification_evidence") or {}).get("attempts")
+        if not isinstance(attempts, list) or not attempts:
+            return {
+                "settled": False,
+                "reason": "unsafe_or_legacy_dispatch_attempts_missing",
+                "evidence": {"handoff_id": handoff_id},
+                "canonical_key": canonical_key,
+            }
+
+        excluded_providers: list[str] = list(
+            dict.fromkeys(
+                str(p)
+                for p in (dispatch_rec.get("excluded_providers") or ())
+                if isinstance(p, str) and p.strip()
+            )
+        )
+        excluded_set = set(excluded_providers)
+        verified_attempted: list[str] = []
+        retryable_pre_work_providers: list[str] = []
+        all_pre_work_safe = True
+        last_excerpt = ""
+        for att in attempts:
+            if not isinstance(att, dict):
+                return {
+                    "settled": False,
+                    "reason": "unsafe_dispatch_attempt_entry",
+                    "evidence": {"handoff_id": handoff_id},
+                    "canonical_key": canonical_key,
+                }
+            if att.get("human_input_wait"):
+                return {
+                    "settled": True,
+                    "classification": {
+                        "classification": "human_input_wait",
+                        "eligible_for_fallback": False,
+                        "reason": "Dispatch attempt waited for human input.",
+                    },
+                    "evidence": {"handoff_id": handoff_id},
+                    "canonical_key": canonical_key,
+                }
+            if "dispatch_id" in att:
+                if att.get("worker_state") != "failed" or att.get("provider_failure") is not True:
+                    return {
+                        "settled": True,
+                        "classification": {
+                            "classification": "task_failure",
+                            "eligible_for_fallback": False,
+                            "reason": "Dispatch attempt failed with non-provider or unsettled error.",
+                        },
+                        "evidence": {"handoff_id": handoff_id, "attempt": att},
+                        "canonical_key": canonical_key,
+                    }
+                provider_name = att.get("provider")
+                if isinstance(provider_name, str) and provider_name:
+                    verified_attempted.append(provider_name)
+                excerpt = att.get("error_excerpt") if isinstance(att.get("error_excerpt"), str) else ""
+                if excerpt:
+                    last_excerpt = excerpt
+                pre_work_ok = att.get("pre_work_proven") is True
+                if not pre_work_ok:
+                    all_pre_work_safe = False
+                retryable = (
+                    att.get("retryable_provider_failure") is True
+                    if "retryable_provider_failure" in att
+                    else run.is_retryable_provider_failure(att, excerpt)
+                )
+                if (
+                    pre_work_ok
+                    and retryable
+                    and isinstance(provider_name, str)
+                    and provider_name
+                    and provider_name not in excluded_set
+                    and provider_name not in retryable_pre_work_providers
+                ):
+                    retryable_pre_work_providers.append(provider_name)
+            elif att.get("status") == "already_attempted_skipped":
+                provider_name = att.get("provider")
+                if isinstance(provider_name, str) and provider_name and provider_name not in excluded_set:
+                    excluded_providers.append(provider_name)
+                    excluded_set.add(provider_name)
+            elif att.get("status") != "cooldown_skipped":
+                return {
+                    "settled": False,
+                    "reason": "unsafe_dispatch_attempt_status",
+                    "evidence": {"attempt": att},
+                    "canonical_key": canonical_key,
+                }
+
+        spec_text = Path(spec_file).read_text(encoding="utf-8").strip()
+        return {
+            "settled": True,
+            "classification": {
+                "classification": "provider_failure",
+                "eligible_for_fallback": True,
+                "reason": "Dispatch exhausted lane due to provider cooldowns or provider failures.",
+            },
+            "evidence": {
+                "handoff_id": handoff_id,
+                "caller_kind": dispatch_rec.get("caller_kind"),
+                "attempts_count": len(attempts),
+                "excerpt": run.redact_text(last_excerpt)[-1500:],
+            },
+            "raw_record": dispatch_rec,
+            "worktree": str(Path(worktree).resolve()),
+            "spec_file": str(Path(spec_file).resolve()),
+            "task_request": spec_text,
+            "title": title.strip(),
+            "canonical_key": canonical_key,
+            "verified_role": role,
+            "verified_lane": lane,
+            "verified_attempted": verified_attempted,
+            "excluded_providers": excluded_providers,
+            "retryable_pre_work_providers": retryable_pre_work_providers,
+            "all_pre_work_safe": all_pre_work_safe,
+            "verified_failed_provider": verified_attempted[-1] if verified_attempted else None,
         }
 
     def _verify_and_classify(
@@ -702,9 +955,12 @@ class RecoverySupervisor:
         automation_id: str | None,
         run_id: str | None,
         dispatch_id: str | None,
+        handoff_id: str | None = None,
         caller_failed_provider: str | None,
         caller_prior_attempted: list[str],
     ) -> dict[str, Any]:
+        if kind == "dispatch":
+            return self._verify_dispatch_record(None, handoff_id)
         if kind == "worker":
             if not dispatch_id:
                 return {"settled": False, "reason": "missing_dispatch_id", "evidence": {}}
@@ -732,22 +988,59 @@ class RecoverySupervisor:
             verified_role = show.get("role") or (audit or {}).get("role")
             verified_lane = show.get("lane") or (audit or {}).get("lane")
             verified_attempted: list[str] = []
+            excluded_providers: list[str] = list(
+                dict.fromkeys(
+                    str(p)
+                    for p in ((audit or {}).get("excluded_providers") or ())
+                    if isinstance(p, str) and p.strip()
+                )
+            )
+            audit_pre_work_safe = True
+            retryable_pre_work_providers: list[str] = []
             if audit and isinstance(audit.get("attempts"), list):
                 for att in audit["attempts"]:
-                    if isinstance(att, dict) and att.get("provider") and att.get("status") not in (
-                        "already_attempted_skipped",
-                        "cooldown_skipped",
-                    ):
-                        verified_attempted.append(att["provider"])
+                    if not isinstance(att, dict):
+                        continue
+                    prov = att.get("provider")
+                    if att.get("status") == "already_attempted_skipped":
+                        if isinstance(prov, str) and prov and prov not in excluded_providers:
+                            excluded_providers.append(prov)
+                        continue
+                    if prov and att.get("status") != "cooldown_skipped":
+                        verified_attempted.append(prov)
+                        if "dispatch_id" in att:
+                            if att.get("pre_work_proven") is not True:
+                                audit_pre_work_safe = False
+                            elif att.get("retryable_provider_failure") is True and prov not in retryable_pre_work_providers:
+                                retryable_pre_work_providers.append(prov)
             verified_failed = (
                 show.get("modelKey")
                 or _provider_key(show.get("agent"), show.get("model"))
                 or (verified_attempted[-1] if verified_attempted else None)
             )
+            pre_work_ok, pre_work_reason = run.transcript_proves_pre_work_failure(
+                read_result, show, latest_turn_only=False
+            )
+            retryable = run.is_retryable_provider_failure(show, text)
+            if (
+                pre_work_ok
+                and retryable
+                and verified_failed
+                and verified_failed not in retryable_pre_work_providers
+            ):
+                retryable_pre_work_providers.append(verified_failed)
+            excluded_set = set(excluded_providers)
+            retryable_pre_work_providers = [p for p in retryable_pre_work_providers if p not in excluded_set]
             return {
                 "settled": True,
                 "classification": classification,
-                "evidence": {"worker_show": show, "excerpt": run.redact_text(text)[-1500:]},
+                "evidence": {
+                    "worker_show": show,
+                    "excerpt": run.redact_text(text)[-1500:],
+                    "pre_work_proven": pre_work_ok,
+                    "pre_work_reason": pre_work_reason,
+                    "retryable_provider_failure": retryable,
+                },
                 "raw_record": show,
                 "worktree": show.get("worktree") or (audit or {}).get("worktree"),
                 "task_id": show.get("taskId"),
@@ -756,6 +1049,9 @@ class RecoverySupervisor:
                 "verified_lane": verified_lane,
                 "verified_failed_provider": verified_failed,
                 "verified_attempted": verified_attempted,
+                "excluded_providers": excluded_providers,
+                "retryable_pre_work_providers": retryable_pre_work_providers,
+                "all_pre_work_safe": pre_work_ok and audit_pre_work_safe,
             }
 
         if kind == "bot_chat":
@@ -860,6 +1156,10 @@ class RecoverySupervisor:
                 or agent_read.get("modelKey")
                 or _provider_key(agent_read.get("agent"), agent_read.get("model"))
             )
+            pre_work_ok, pre_work_reason = run.transcript_proves_pre_work_failure(
+                agent_read, agent_show, latest_turn_only=True
+            )
+            retryable = run.is_retryable_provider_failure(agent_show, latest_text)
             return {
                 "settled": True,
                 "classification": run.classify_worker_failure(agent_show, latest_text),
@@ -869,6 +1169,9 @@ class RecoverySupervisor:
                     "agent_read_state": effective_read_state,
                     "bot_assets": bot_assets,
                     "excerpt": run.redact_text(latest_text)[-1500:],
+                    "pre_work_proven": pre_work_ok,
+                    "pre_work_reason": pre_work_reason,
+                    "retryable_provider_failure": retryable,
                 },
                 "raw_record": chat,
                 "resolved_bot": canonical_bot,
@@ -880,6 +1183,9 @@ class RecoverySupervisor:
                 "verified_role": agent_show.get("role") or (audit or {}).get("role"),
                 "verified_lane": agent_show.get("lane") or (audit or {}).get("lane"),
                 "verified_failed_provider": verified_failed,
+                "pre_work_proven": pre_work_ok,
+                "retryable_provider_failure": retryable,
+                "all_pre_work_safe": pre_work_ok,
             }
 
         if kind == "automation":
@@ -955,6 +1261,21 @@ class RecoverySupervisor:
                 or _provider_key(target_run.get("agent"), target_run.get("model"))
                 or _automation_provider_key(auto)
             )
+            retryable = run.is_retryable_provider_failure(target_run, run_text)
+            if run_status == "dispatch_failed":
+                pre_work_ok, pre_work_reason = True, "dispatch_failed_before_start"
+            elif target_run.get("chatSessionId"):
+                try:
+                    sess_read = self.adapter.agent_read(str(target_run["chatSessionId"]), limit=20)
+                    pre_work_ok, pre_work_reason = run.transcript_proves_pre_work_failure(
+                        sess_read, target_run, latest_turn_only=True
+                    )
+                except Exception:
+                    pre_work_ok, pre_work_reason = False, "session_transcript_unavailable"
+            elif target_run.get("terminalSessionId"):
+                pre_work_ok, pre_work_reason = False, "terminal_session_side_effects_unverified"
+            else:
+                pre_work_ok, pre_work_reason = True, "pre_session_automation_failure"
             return {
                 "settled": True,
                 "classification": run.classify_worker_failure(target_run, run_text),
@@ -962,6 +1283,9 @@ class RecoverySupervisor:
                     "automation": auto,
                     "run": target_run,
                     "excerpt": run.redact_text(run_text)[-1500:],
+                    "pre_work_proven": pre_work_ok,
+                    "pre_work_reason": pre_work_reason,
+                    "retryable_provider_failure": retryable,
                 },
                 "raw_record": auto,
                 "target_run": target_run,
@@ -972,6 +1296,9 @@ class RecoverySupervisor:
                 "verified_role": auto.get("role") or (audit or {}).get("role"),
                 "verified_lane": auto.get("lane") or (audit or {}).get("lane"),
                 "verified_failed_provider": verified_failed,
+                "pre_work_proven": pre_work_ok,
+                "retryable_provider_failure": retryable,
+                "all_pre_work_safe": pre_work_ok,
             }
 
         raise ValueError(f"Unsupported recovery target kind: {kind}")
@@ -997,6 +1324,45 @@ class RecoverySupervisor:
             context_lines.append(f"Prior failure excerpt (redacted): {run.redact_text(excerpt)[:600]}")
         return task_request.strip() + "\n\n" + "\n".join(context_lines)
 
+    @staticmethod
+    def _evaluate_post_cooldown_eligibility(
+        record: dict[str, Any],
+        plan: dict[str, Any] | None,
+        providers: list[dict[str, Any]],
+    ) -> tuple[bool, str | None, list[dict[str, Any]], bool]:
+        """Return (eligible, block_reason, candidate_pool, is_post_cooldown)."""
+        plan_obj = plan or {}
+        excluded_set = set(record.get("excluded_providers") or plan_obj.get("excluded_providers") or ())
+        attempted_set = set(record.get("attempted_providers") or ())
+        unused = [p for p in providers if p["name"] not in attempted_set and p["name"] not in excluded_set]
+        if unused:
+            return True, None, unused, False
+
+        post_attempts = int(
+            plan_obj.get("post_cooldown_attempts", record.get("post_cooldown_attempts", 0))
+        )
+        max_post = int(plan_obj.get("max_post_cooldown_attempts", 1))
+        if post_attempts >= max_post:
+            return False, "post_cooldown_attempt_exhausted_user_decision_required", [], True
+
+        all_pre_work_safe = bool(
+            plan_obj.get("all_pre_work_safe", record.get("all_pre_work_safe", False))
+        )
+        if not all_pre_work_safe:
+            return False, "prior_side_effects_not_proven_absent_user_decision_required", [], True
+
+        retryable_set = set(
+            plan_obj.get("retryable_pre_work_providers")
+            or record.get("retryable_pre_work_providers")
+            or ()
+        )
+        retryable_pool = [
+            p for p in providers if p["name"] in retryable_set and p["name"] not in excluded_set
+        ]
+        if not retryable_pool:
+            return False, "non_retryable_provider_failure_user_decision_required", [], True
+        return True, None, retryable_pool, True
+
     def _build_delayed_resume_plan(
         self,
         *,
@@ -1012,16 +1378,40 @@ class RecoverySupervisor:
         spec_file: Path | None,
         handoff_prompt: str,
         results_to: str | None,
+        attempted: list[str] | None = None,
+        excluded_providers: list[str] | None = None,
+        retryable_pre_work_providers: list[str] | None = None,
+        all_pre_work_safe: bool = False,
+        post_cooldown_attempts: int = 0,
+        title: str | None = None,
+        probe_attempts: int = 0,
+        resume_attempts: int = 0,
+        now_ts: float | None = None,
     ) -> dict[str, Any]:
         settings = self._settings()
-        earliest_ts = time.time() + int(settings["delayed_resume_delay_seconds"])
+        current_ts = now_ts if now_ts is not None else time.time()
+        attempted_set = set(attempted or ())
+        excluded_set = set(excluded_providers or ())
+        retryable_set = set(retryable_pre_work_providers or ())
+        unused_keys = [
+            p["name"]
+            for p in providers
+            if p["name"] not in attempted_set and p["name"] not in excluded_set
+        ]
+        target_keys = unused_keys or [
+            p["name"]
+            for p in providers
+            if p["name"] in retryable_set and p["name"] not in excluded_set
+        ]
         reset_timestamps = [
-            _parse_iso(entry["reset_at"])
-            for entry in cooldowns.values()
-            if isinstance(entry.get("reset_at"), str)
+            _parse_iso(cooldowns[key]["reset_at"])
+            for key in target_keys
+            if isinstance(cooldowns.get(key), dict) and isinstance(cooldowns[key].get("reset_at"), str)
         ]
         if reset_timestamps:
             earliest_ts = min(reset_timestamps)
+        else:
+            earliest_ts = current_ts + int(settings["delayed_resume_delay_seconds"])
         return {
             "status": "pending_probe",
             "requires_health_probe": True,
@@ -1030,9 +1420,19 @@ class RecoverySupervisor:
             "role": role,
             "lane": lane,
             "preferred_provider": preferred_provider,
-            "candidate_models": [p["name"] for p in providers],
+            "candidate_models": [p["name"] for p in providers if p["name"] not in excluded_set],
+            "excluded_providers": list(excluded_providers or ()),
+            "retryable_pre_work_providers": list(retryable_pre_work_providers or ()),
+            "all_pre_work_safe": bool(all_pre_work_safe),
+            "post_cooldown_attempts": int(post_cooldown_attempts),
+            "max_post_cooldown_attempts": 1,
             "probe_timeout_seconds": int(settings["health_probe_timeout_seconds"]),
+            "probe_attempts": probe_attempts,
+            "max_probe_attempts": int(settings["max_probe_attempts"]),
+            "resume_attempts": resume_attempts,
+            "max_resume_attempts": int(settings["max_resume_attempts"]),
             "target_kind": kind,
+            "title": title,
             "original_ids": original_ids,
             "original_enabled": original_enabled,
             "worktree": worktree,
@@ -1252,7 +1652,7 @@ class RecoverySupervisor:
         prompt: str,
         role: str,
         lane: str,
-        attempted: list[str],
+        skip_providers: list[str] | set[str],
         only_provider: str | None = None,
     ) -> dict[str, Any]:
         if not worktree:
@@ -1283,7 +1683,7 @@ class RecoverySupervisor:
                     lane=lane,
                 ),
                 orca=self.adapter.orca,
-                skip_providers=set(attempted),
+                skip_providers=set(skip_providers),
                 only_provider=only_provider,
                 dispatch_meta={"recovery_id": record["recovery_id"]},
                 state_dir=self.state_dir,
@@ -1298,10 +1698,27 @@ class RecoverySupervisor:
 
         attempts = job_result.get("attempts", [])
         executed = [a for a in attempts if "dispatch_id" in a]
+        retryable_list = list(record.get("retryable_pre_work_providers") or ())
+        excluded_set = set(record.get("excluded_providers") or ())
         for attempt in executed:
             provider_name = attempt.get("provider")
             if provider_name and provider_name not in record["attempted_providers"]:
                 record["attempted_providers"].append(provider_name)
+            if attempt.get("worker_state") == "failed":
+                if attempt.get("pre_work_proven") is not True:
+                    record["all_pre_work_safe"] = False
+                    if isinstance(record.get("delayed_resume_plan"), dict):
+                        record["delayed_resume_plan"]["all_pre_work_safe"] = False
+                elif (
+                    attempt.get("retryable_provider_failure") is True
+                    and provider_name
+                    and provider_name not in excluded_set
+                    and provider_name not in retryable_list
+                ):
+                    retryable_list.append(provider_name)
+        record["retryable_pre_work_providers"] = retryable_list
+        if isinstance(record.get("delayed_resume_plan"), dict):
+            record["delayed_resume_plan"]["retryable_pre_work_providers"] = list(retryable_list)
         last = executed[-1] if executed else {}
         record["actual_provider"] = job_result.get("selected_provider") or last.get("provider")
         record["launch_intent"]["step"] = "worker_finished"
@@ -1339,16 +1756,20 @@ class RecoverySupervisor:
         handoff_prompt: str,
         results_to: str | None,
         execute: bool,
+        title: str | None = None,
+        now_ts: float | None = None,
     ) -> dict[str, Any]:
+        existing_plan = record.get("delayed_resume_plan") or {}
         cooldowns = {
             p["name"]: {
-                "remaining_seconds": run.cooldown_remaining(self.cooldown_path, p["name"]),
-                "reset_at": run.cooldown_reset_at(self.cooldown_path, p["name"]),
+                "remaining_seconds": run.cooldown_remaining(self.cooldown_path, p["name"], at_ts=now_ts),
+                "reset_at": run.cooldown_reset_at(self.cooldown_path, p["name"], at_ts=now_ts),
             }
             for p in providers
-            if run.cooldown_remaining(self.cooldown_path, p["name"])
+            if run.cooldown_remaining(self.cooldown_path, p["name"], at_ts=now_ts)
         }
-        cooldowns.update(record.get("cooldown", {}))
+        for key, value in (record.get("cooldown") or {}).items():
+            cooldowns.setdefault(key, value)
         record["cooldown"] = cooldowns
         plan = self._build_delayed_resume_plan(
             kind=kind,
@@ -1363,6 +1784,22 @@ class RecoverySupervisor:
             spec_file=spec_file,
             handoff_prompt=handoff_prompt,
             results_to=results_to,
+            attempted=record.get("attempted_providers", []),
+            excluded_providers=record.get("excluded_providers", existing_plan.get("excluded_providers", [])),
+            retryable_pre_work_providers=record.get(
+                "retryable_pre_work_providers",
+                existing_plan.get("retryable_pre_work_providers", []),
+            ),
+            all_pre_work_safe=bool(
+                record.get("all_pre_work_safe", existing_plan.get("all_pre_work_safe", False))
+            ),
+            post_cooldown_attempts=int(
+                existing_plan.get("post_cooldown_attempts", record.get("post_cooldown_attempts", 0))
+            ),
+            title=title or existing_plan.get("title"),
+            probe_attempts=int(existing_plan.get("probe_attempts", 0)),
+            resume_attempts=int(existing_plan.get("resume_attempts", 0)),
+            now_ts=now_ts,
         )
         record["delayed_resume_plan"] = plan
         record["escalation_required"] = not policy["allow_lane_escalation"]
@@ -1398,6 +1835,7 @@ class RecoverySupervisor:
         preferred_provider: str | None = None,
         failed_provider: str | None = None,
         prior_attempted: list[str] | None = None,
+        unattended: bool = True,
         execute: bool = False,
     ) -> dict[str, Any]:
         if not role or not lane:
@@ -1425,6 +1863,7 @@ class RecoverySupervisor:
                     preferred_provider=preferred_provider,
                     failed_provider=failed_provider,
                     prior_attempted=prior_attempted,
+                    unattended=unattended,
                     execute=True,
                 )
         return self._recover_impl(
@@ -1445,6 +1884,7 @@ class RecoverySupervisor:
             preferred_provider=preferred_provider,
             failed_provider=failed_provider,
             prior_attempted=prior_attempted,
+            unattended=unattended,
             execute=False,
         )
 
@@ -1456,7 +1896,10 @@ class RecoverySupervisor:
         chat_id: str | None,
         automation_id: str | None,
         dispatch_id: str | None,
+        handoff_id: str | None = None,
     ) -> str:
+        if kind == "dispatch":
+            return f"target:dispatch:{handoff_id or dispatch_id or 'unknown'}"
         if kind == "bot_chat":
             resolved = self.adapter.read_bot_assets(bot).get("resolved_bot") if bot else "unknown"
             return f"target:bot_chat:{resolved}:{chat_id or 'unknown'}"
@@ -1484,6 +1927,7 @@ class RecoverySupervisor:
         preferred_provider: str | None,
         failed_provider: str | None,
         prior_attempted: list[str] | None,
+        unattended: bool,
         execute: bool,
     ) -> dict[str, Any]:
         if caller_key:
@@ -1538,6 +1982,8 @@ class RecoverySupervisor:
         )
         verified_attempted = list(inspection.get("verified_attempted") or ())
         verified_failed = inspection.get("verified_failed_provider")
+        excluded_providers = list(dict.fromkeys(inspection.get("excluded_providers") or ()))
+        excluded_set = set(excluded_providers)
 
         attempted = list(
             dict.fromkeys(
@@ -1549,8 +1995,27 @@ class RecoverySupervisor:
                 ]
             )
         )
+        caller_prior_unverified = any(
+            p not in set(verified_attempted) and p != verified_failed
+            for p in (prior_attempted or ())
+        )
+        if kind in ("bot_chat", "automation"):
+            pre_work_ok = bool(inspection.get("pre_work_proven", False))
+            retryable = bool(inspection.get("retryable_provider_failure", False))
+            effective_failed = verified_failed or failed_provider
+            retryable_pre_work_providers = (
+                [effective_failed]
+                if (pre_work_ok and retryable and effective_failed and effective_failed not in excluded_set)
+                else []
+            )
+            all_pre_work_safe = pre_work_ok and not caller_prior_unverified
+        else:
+            retryable_pre_work_providers = list(inspection.get("retryable_pre_work_providers") or ())
+            all_pre_work_safe = bool(inspection.get("all_pre_work_safe", False)) and not caller_prior_unverified
         record: dict[str, Any] = {
             "recovery_id": recovery_id,
+            "supervision_schema_version": run.SUPERVISION_SCHEMA_VERSION,
+            "unattended_supervision": bool(unattended),
             "idempotency_key": canonical_key,
             "caller_idempotency_key": caller_key,
             "deduplicated": False,
@@ -1562,6 +2027,10 @@ class RecoverySupervisor:
             "preferred_provider": preferred_provider,
             "actual_provider": None,
             "attempted_providers": attempted,
+            "excluded_providers": excluded_providers,
+            "retryable_pre_work_providers": retryable_pre_work_providers,
+            "all_pre_work_safe": all_pre_work_safe,
+            "post_cooldown_attempts": 0,
             "in_place_provider_switch": False,
             "mid_task_switch_allowed": False,
             "original_enabled": original_enabled,
@@ -1651,6 +2120,7 @@ class RecoverySupervisor:
             role=role,
             lane=lane,
             attempted=attempted,
+            excluded_providers=excluded_providers,
             preferred_provider=preferred_provider,
         )
         record["preferred_provider"] = meta["preferred_provider"]
@@ -1663,6 +2133,18 @@ class RecoverySupervisor:
             }
 
         if next_provider is None:
+            eligible, block_reason, _, _ = self._evaluate_post_cooldown_eligibility(record, None, providers)
+            if not eligible:
+                record["block_reason"] = block_reason
+                record["user_decision_required"] = True
+                record["escalation_required"] = not policy["allow_lane_escalation"]
+                self._record_event(
+                    record,
+                    "recovery_blocked_exhausted",
+                    "blocked",
+                    {"attempted_providers": attempted, "excluded_providers": excluded_providers, "reason": block_reason},
+                )
+                return self._persist(record, claim_idempotency=execute)
             if kind == "automation" and original_enabled is True:
                 record["planned_actions"].append(
                     {"action": "automations.edit", "automation_id": automation_id, "enabled": False}
@@ -1771,7 +2253,7 @@ class RecoverySupervisor:
             prompt=handoff_prompt,
             role=role,
             lane=policy["lane"],
-            attempted=attempted,
+            skip_providers=set(attempted) | excluded_set,
         )
         return self._finalize_sync_worker_result(
             record=record,
@@ -1821,6 +2303,26 @@ class RecoverySupervisor:
             )
             return self._persist(record, claim_idempotency=True)
         if status == "lane_exhausted":
+            existing_plan = record.get("delayed_resume_plan") or {}
+            settings = self._settings()
+            eligible, reason, _, _ = self._evaluate_post_cooldown_eligibility(record, existing_plan, providers)
+            resume_attempts = int(existing_plan.get("resume_attempts", 0))
+            max_resume = int(existing_plan.get("max_resume_attempts", settings["max_resume_attempts"]))
+            if not eligible or resume_attempts >= max_resume:
+                if eligible and resume_attempts >= max_resume:
+                    reason = "max_resume_attempts_exceeded"
+                record["block_reason"] = reason
+                record["user_decision_required"] = True
+                record["escalation_required"] = not policy["allow_lane_escalation"]
+                if record.get("delayed_resume_plan"):
+                    record["delayed_resume_plan"]["status"] = "blocked_user_decision_required"
+                self._record_event(
+                    record,
+                    "delayed_resume_blocked_exhausted",
+                    "blocked",
+                    {"attempted_providers": record.get("attempted_providers", []), "reason": reason},
+                )
+                return self._persist(record, claim_idempotency=True)
             return self._enter_exhausted_plan(
                 record=record,
                 kind=kind,
@@ -1836,6 +2338,7 @@ class RecoverySupervisor:
                 handoff_prompt=handoff_prompt,
                 results_to=results_to,
                 execute=execute,
+                now_ts=time.time(),
             )
         if status != "blocked":
             self._record_event(
@@ -1977,6 +2480,11 @@ class RecoverySupervisor:
                     actual_provider,
                     int(SETTINGS.get("provider_cooldown_seconds", 900)),
                 )
+            if int(record.get("post_cooldown_attempts") or 0) >= 1:
+                record["block_reason"] = "post_cooldown_attempt_exhausted_user_decision_required"
+                record["user_decision_required"] = True
+                if isinstance(record.get("delayed_resume_plan"), dict):
+                    record["delayed_resume_plan"]["status"] = "blocked_user_decision_required"
             self._record_event(
                 record,
                 "reconcile_failed",
@@ -2033,6 +2541,32 @@ class RecoverySupervisor:
             raise ValueError(f"Record in status={record.get('status')!r} is not eligible for delayed resume")
 
         current_ts = now_ts if now_ts is not None else time.time()
+        settings = self._settings()
+        max_probes = int(plan.get("max_probe_attempts", settings["max_probe_attempts"]))
+        max_resumes = int(plan.get("max_resume_attempts", settings["max_resume_attempts"]))
+        if int(plan.get("probe_attempts", 0)) >= max_probes:
+            record["block_reason"] = "max_probe_attempts_exceeded"
+            record["user_decision_required"] = True
+            plan["status"] = "blocked_user_decision_required"
+            self._record_event(
+                record,
+                "delayed_resume_blocked_max_probes",
+                "blocked",
+                {"probe_attempts": plan.get("probe_attempts", 0), "max_probe_attempts": max_probes},
+            )
+            return self._persist(record, claim_idempotency=execute)
+        if int(plan.get("resume_attempts", 0)) >= max_resumes:
+            record["block_reason"] = "max_resume_attempts_exceeded"
+            record["user_decision_required"] = True
+            plan["status"] = "blocked_user_decision_required"
+            self._record_event(
+                record,
+                "delayed_resume_blocked_max_resumes",
+                "blocked",
+                {"resume_attempts": plan.get("resume_attempts", 0), "max_resume_attempts": max_resumes},
+            )
+            return self._persist(record, claim_idempotency=execute)
+
         eligible_ts = _parse_iso(plan["eligible_at"])
         if current_ts < eligible_ts:
             self._record_event(
@@ -2054,6 +2588,7 @@ class RecoverySupervisor:
             automation_id=orig_ids.get("automation_id"),
             run_id=orig_ids.get("run_id"),
             dispatch_id=orig_ids.get("dispatch_id"),
+            handoff_id=orig_ids.get("handoff_id"),
             caller_failed_provider=None,
             caller_prior_attempted=record.get("attempted_providers", []),
         )
@@ -2068,33 +2603,52 @@ class RecoverySupervisor:
                 self._record_event(record, "delayed_resume_automation_enabled_blocked", "blocked")
                 return self._persist(record, claim_idempotency=execute)
 
-        candidate, providers, policy, meta = self._select_next_provider(
-            role=plan["role"],
-            lane=plan["lane"],
-            attempted=record.get("attempted_providers", []),
-            preferred_provider=plan.get("preferred_provider"),
-            at_ts=current_ts,
+        providers, policy = resolve_policy(plan["role"], plan["lane"])
+        if not providers:
+            raise ValueError(f"No models satisfy role={plan['role']!r} lane={plan['lane']!r}")
+        eligible, block_reason, candidate_pool, is_post_cooldown = self._evaluate_post_cooldown_eligibility(
+            record, plan, providers
         )
-        if candidate is None:
-            attempted_set = set(record.get("attempted_providers", []))
-            unused_in_cooldown = [p for p in providers if p["name"] not in attempted_set]
-            if unused_in_cooldown and meta["cooldowns"]:
-                self._record_event(
-                    record,
-                    "delayed_resume_waiting_for_unused_provider_cooldown",
-                    "waiting_for_reset",
-                    {"cooldowns": meta["cooldowns"]},
-                )
-                return self._persist(record, claim_idempotency=execute)
-
-            record["block_reason"] = "no_unused_eligible_provider_user_decision_required"
+        if not eligible:
+            record["block_reason"] = block_reason
             record["user_decision_required"] = True
+            record["escalation_required"] = not policy["allow_lane_escalation"]
             plan["status"] = "blocked_user_decision_required"
             self._record_event(
                 record,
-                "delayed_resume_blocked_no_unused_provider",
+                "delayed_resume_blocked_ineligible",
                 "blocked",
-                {"attempted_providers": record.get("attempted_providers", []), "reason": record["block_reason"]},
+                {"attempted_providers": record.get("attempted_providers", []), "reason": block_reason},
+            )
+            return self._persist(record, claim_idempotency=execute)
+
+        cooldowns: dict[str, Any] = {}
+        candidate = None
+        for provider in candidate_pool:
+            key = provider["name"]
+            remaining = run.cooldown_remaining(self.cooldown_path, key, at_ts=current_ts)
+            if remaining:
+                cooldowns[key] = {
+                    "remaining_seconds": remaining,
+                    "reset_at": run.cooldown_reset_at(self.cooldown_path, key, at_ts=current_ts),
+                }
+            elif candidate is None:
+                candidate = provider
+
+        if candidate is None:
+            pool_resets = [
+                _parse_iso(cooldowns[p["name"]]["reset_at"])
+                for p in candidate_pool
+                if isinstance(cooldowns.get(p["name"]), dict)
+                and isinstance(cooldowns[p["name"]].get("reset_at"), str)
+            ]
+            if pool_resets:
+                plan["eligible_at"] = _iso_from_ts(min(pool_resets))
+            self._record_event(
+                record,
+                "delayed_resume_waiting_for_pool_cooldown",
+                "waiting_for_reset",
+                {"cooldowns": cooldowns, "eligible_at": plan["eligible_at"]},
             )
             return self._persist(record, claim_idempotency=execute)
 
@@ -2103,10 +2657,11 @@ class RecoverySupervisor:
                 record,
                 "delayed_resume_dry_run_probe_required",
                 "dry_run_probe_required",
-                {"candidate": candidate["name"]},
+                {"candidate": candidate["name"], "is_post_cooldown_attempt": is_post_cooldown},
             )
             return run.redact_secrets(record)
 
+        plan["probe_attempts"] = int(plan.get("probe_attempts", 0)) + 1
         probe_result = self.adapter.probe_health(
             candidate, timeout_seconds=int(plan.get("probe_timeout_seconds", 30))
         )
@@ -2116,24 +2671,57 @@ class RecoverySupervisor:
         if not probe_result.get("ok"):
             cooldown_seconds = int(SETTINGS.get("provider_cooldown_seconds", 900))
             run.update_cooldown(self.cooldown_path, candidate["name"], cooldown_seconds)
-            plan["status"] = "probe_failed"
             plan["probe_passed"] = False
-            plan["eligible_at"] = _iso_from_ts(current_ts + cooldown_seconds)
+            if plan["probe_attempts"] >= max_probes:
+                record["block_reason"] = "max_probe_attempts_exceeded"
+                record["user_decision_required"] = True
+                plan["status"] = "blocked_user_decision_required"
+                self._record_event(
+                    record,
+                    "delayed_resume_probe_max_attempts_blocked",
+                    "blocked",
+                    {"candidate": candidate["name"], "probe_attempts": plan["probe_attempts"]},
+                )
+                return self._persist(record, claim_idempotency=True)
+
+            # Determine next eligibility across remaining candidate pool
+            ready_other = any(
+                p["name"] != candidate["name"]
+                and run.cooldown_remaining(self.cooldown_path, p["name"], at_ts=current_ts) == 0
+                for p in candidate_pool
+            )
+            if ready_other:
+                next_eligible_ts = current_ts
+            else:
+                pool_resets = [
+                    _parse_iso(r)
+                    for p in candidate_pool
+                    for r in [run.cooldown_reset_at(self.cooldown_path, p["name"], at_ts=current_ts)]
+                    if isinstance(r, str)
+                ]
+                next_eligible_ts = min(pool_resets) if pool_resets else (current_ts + cooldown_seconds)
+            plan["status"] = "probe_failed"
+            plan["eligible_at"] = _iso_from_ts(next_eligible_ts)
             self._record_event(
                 record,
                 "delayed_resume_probe_failed",
                 "probe_failed",
-                {"candidate": candidate["name"], "next_eligible_at": plan["eligible_at"]},
+                {"candidate": candidate["name"], "next_eligible_at": plan["eligible_at"], "probe_attempts": plan["probe_attempts"]},
             )
             return self._persist(record, claim_idempotency=True)
 
         run.update_cooldown(self.cooldown_path, candidate["name"], 0)
         plan["probe_passed"] = True
         plan["status"] = "probe_passed"
+        plan["resume_attempts"] = int(plan.get("resume_attempts", 0)) + 1
+        if is_post_cooldown:
+            next_post_attempts = int(plan.get("post_cooldown_attempts", 0)) + 1
+            plan["post_cooldown_attempts"] = next_post_attempts
+            plan["is_post_cooldown_attempt"] = True
+            record["post_cooldown_attempts"] = next_post_attempts
         record["actual_provider"] = candidate["name"]
 
         kind = plan["target_kind"]
-        settings = self._settings()
         if (kind == "bot_chat" and orig_ids.get("bot")) or (kind == "automation" and orig_ids.get("bot")):
             name = (
                 f"Resumed {orig_ids['bot']} ({record['recovery_id']})"
@@ -2152,10 +2740,20 @@ class RecoverySupervisor:
             )
 
         spec_path = Path(plan["spec_file"]) if plan.get("spec_file") else None
-        title = (
+        title = plan.get("title") or (
             f"Resumed automation {orig_ids['automation_id']}"
             if kind == "automation"
-            else f"Resumed worker {orig_ids.get('dispatch_id')}"
+            else (
+                f"Resumed dispatch {orig_ids.get('handoff_id')}"
+                if kind == "dispatch"
+                else f"Resumed worker {orig_ids.get('dispatch_id')}"
+            )
+        )
+        excluded_set = set(record.get("excluded_providers") or plan.get("excluded_providers") or ())
+        skip_for_worker = (
+            excluded_set
+            if is_post_cooldown
+            else (set(record.get("attempted_providers", [])) | excluded_set)
         )
         job_result = self._run_worker_recovery(
             record=record,
@@ -2165,7 +2763,7 @@ class RecoverySupervisor:
             prompt=plan["handoff_prompt"],
             role=plan["role"],
             lane=plan["lane"],
-            attempted=record.get("attempted_providers", []),
+            skip_providers=skip_for_worker,
             only_provider=candidate["name"],
         )
         return self._finalize_sync_worker_result(
@@ -2184,6 +2782,507 @@ class RecoverySupervisor:
             results_to=plan.get("results_to"),
             execute=True,
         )
+
+    def register_dispatch_exhausted(
+        self,
+        dispatch_record: dict[str, Any],
+        *,
+        execute: bool = True,
+        unattended: bool | None = None,
+        now_ts: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Create or return an idempotent durable recovery record for an exhausted dispatch."""
+        handoff_id = str(dispatch_record.get("handoff_id") or "")
+        if not handoff_id or not HANDOFF_ID_RE.fullmatch(handoff_id):
+            return None
+        if execute:
+            with self._lock_key(f"target:dispatch:{handoff_id}"):
+                return self._register_dispatch_exhausted_impl(
+                    dispatch_record,
+                    handoff_id=handoff_id,
+                    execute=True,
+                    unattended=unattended,
+                    now_ts=now_ts,
+                )
+        return self._register_dispatch_exhausted_impl(
+            dispatch_record,
+            handoff_id=handoff_id,
+            execute=False,
+            unattended=unattended,
+            now_ts=now_ts,
+        )
+
+    def _register_dispatch_exhausted_impl(
+        self,
+        dispatch_record: dict[str, Any],
+        *,
+        handoff_id: str,
+        execute: bool,
+        unattended: bool | None,
+        now_ts: float | None,
+    ) -> dict[str, Any] | None:
+        canonical_key = f"canonical:dispatch:{handoff_id}"
+        existing = self._load_by_key(canonical_key)
+        if existing is not None and _has_side_effect_or_claim(existing):
+            dup = dict(existing)
+            dup["deduplicated"] = True
+            return run.redact_secrets(dup)
+
+        verification = self._verify_dispatch_record(dispatch_record, handoff_id)
+        if not verification.get("settled"):
+            return None
+        classification = verification["classification"]
+        if not classification.get("eligible_for_fallback"):
+            return None
+
+        role = verification["verified_role"]
+        lane = verification["verified_lane"]
+        attempted = list(dict.fromkeys(verification.get("verified_attempted") or ()))
+        excluded_providers = list(dict.fromkeys(verification.get("excluded_providers") or ()))
+        retryable_pre_work_providers = list(verification.get("retryable_pre_work_providers") or ())
+        all_pre_work_safe = bool(verification.get("all_pre_work_safe", False))
+        effective_unattended = (
+            bool(unattended)
+            if unattended is not None
+            else self._is_unattended_opted_in(dispatch_record)
+        )
+        current_ts = now_ts if now_ts is not None else time.time()
+        next_provider, providers, policy, meta = self._select_next_provider(
+            role=role,
+            lane=lane,
+            attempted=attempted,
+            excluded_providers=excluded_providers,
+            preferred_provider=dispatch_record.get("preferred_provider"),
+            at_ts=current_ts,
+        )
+
+        orig_ids = dict(dispatch_record.get("original_ids") or {})
+        orig_ids["handoff_id"] = handoff_id
+        spec_path = Path(verification["spec_file"])
+        handoff_prompt = self._build_handoff_prompt(
+            kind="dispatch",
+            original_ids=orig_ids,
+            worktree=verification["worktree"],
+            excerpt=verification.get("evidence", {}).get("excerpt", ""),
+            task_request=verification["task_request"],
+        )
+        if handoff_prompt is None:
+            return None
+
+        record: dict[str, Any] = {
+            "recovery_id": uuid4().hex[:12],
+            "supervision_schema_version": run.SUPERVISION_SCHEMA_VERSION,
+            "unattended_supervision": effective_unattended,
+            "idempotency_key": canonical_key,
+            "caller_idempotency_key": f"dispatch:{handoff_id}",
+            "deduplicated": False,
+            "mode": "execute" if execute else "dry_run",
+            "target_kind": "dispatch",
+            "status": "inspecting",
+            "role": role,
+            "lane": policy["lane"],
+            "preferred_provider": meta["preferred_provider"],
+            "actual_provider": None,
+            "attempted_providers": attempted,
+            "excluded_providers": excluded_providers,
+            "retryable_pre_work_providers": retryable_pre_work_providers,
+            "all_pre_work_safe": all_pre_work_safe,
+            "post_cooldown_attempts": 0,
+            "in_place_provider_switch": False,
+            "mid_task_switch_allowed": False,
+            "original_enabled": None,
+            "pause_owned": False,
+            "original_ids": orig_ids,
+            "worktree": verification["worktree"],
+            "spec_file": str(spec_path),
+            "results_to": None,
+            "verification_evidence": {
+                **verification.get("evidence", {}),
+                "classification": classification,
+            },
+            "mutations": [],
+            "external_action_receipts": [],
+            "cooldown": dict(meta["cooldowns"]),
+            "delayed_resume_plan": None,
+            "planned_actions": [],
+            "history": [],
+        }
+
+        eligible, block_reason, _, _ = self._evaluate_post_cooldown_eligibility(record, None, providers)
+        if not eligible:
+            record["block_reason"] = block_reason
+            record["user_decision_required"] = True
+            record["escalation_required"] = not policy["allow_lane_escalation"]
+            self._record_event(
+                record,
+                "dispatch_exhausted_blocked",
+                "blocked",
+                {
+                    "attempted_providers": attempted,
+                    "excluded_providers": excluded_providers,
+                    "reason": block_reason,
+                },
+            )
+            return self._persist(record, claim_idempotency=execute)
+
+        plan_record = self._enter_exhausted_plan(
+            record=record,
+            kind="dispatch",
+            role=role,
+            lane=policy["lane"],
+            providers=providers,
+            policy=policy,
+            preferred_provider=meta["preferred_provider"],
+            original_ids=orig_ids,
+            original_enabled=None,
+            worktree=verification["worktree"],
+            spec_file=spec_path,
+            handoff_prompt=handoff_prompt,
+            results_to=None,
+            execute=execute,
+            title=verification["title"],
+            now_ts=current_ts,
+        )
+        # If an unused non-excluded provider is already off cooldown, allow immediate health-probe resume on next check.
+        if next_provider is not None and isinstance(plan_record.get("delayed_resume_plan"), dict):
+            plan_record["delayed_resume_plan"]["eligible_at"] = _iso_from_ts(current_ts)
+            plan_record = self._persist(plan_record, claim_idempotency=execute)
+        return plan_record
+
+    def _seen_cache_path(self) -> Path:
+        return self.recoveries_dir / "supervisor_seen.json"
+
+    def _load_seen_cache(self) -> dict[str, Any]:
+        path = self._seen_cache_path()
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_seen_cache(self, cache: dict[str, Any]) -> None:
+        run.write_state(self._seen_cache_path(), cache)
+
+    def _load_enrolled_automations(self) -> dict[str, dict[str, Any]]:
+        path = self.state_dir / "wiring" / "enrollments.json"
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        autos = data.get("automations") if isinstance(data, dict) else None
+        if not isinstance(autos, dict):
+            return {}
+        return {
+            str(aid): entry
+            for aid, entry in autos.items()
+            if isinstance(aid, str) and aid.strip() and isinstance(entry, dict)
+        }
+
+    @staticmethod
+    def _is_unattended_opted_in(record: dict[str, Any] | None) -> bool:
+        return (
+            isinstance(record, dict)
+            and record.get("supervision_schema_version") == run.SUPERVISION_SCHEMA_VERSION
+            and record.get("unattended_supervision") is True
+        )
+
+    @staticmethod
+    def _is_reconcilable_record(record: dict[str, Any]) -> bool:
+        status = record.get("status")
+        if status == "waiting_for_run":
+            return True
+        if status == "blocked" and record.get("block_reason") == "ambiguous_launch_reconcile_required":
+            launch = record.get("launch_intent") or {}
+            return bool(record.get("recovery_automation_id") or launch.get("automation_name"))
+        return False
+
+    @staticmethod
+    def _is_valid_resumable_record(record: dict[str, Any]) -> bool:
+        if record.get("status") not in RESUMABLE_DELAYED_STATUSES:
+            return False
+        plan = record.get("delayed_resume_plan")
+        if not isinstance(plan, dict):
+            return False
+        return bool(
+            isinstance(plan.get("eligible_at"), str)
+            and isinstance(plan.get("role"), str)
+            and plan["role"].strip()
+            and isinstance(plan.get("lane"), str)
+            and plan["lane"].strip()
+            and isinstance(plan.get("target_kind"), str)
+            and isinstance(plan.get("original_ids"), dict)
+            and (plan.get("handoff_prompt") or plan.get("spec_file"))
+        )
+
+    def supervise(
+        self,
+        *,
+        execute: bool = False,
+        now_ts: float | None = None,
+        check_enrolled_automations: bool = True,
+        max_actions: int | None = None,
+    ) -> dict[str, Any]:
+        """Run one bounded, lock-protected reconcile + delayed-resume supervisor pass."""
+        self.recoveries_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.recoveries_dir / "supervise.lock"
+        with lock_path.open("w", encoding="utf-8") as lock_file:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return {
+                    "status": "skipped_lock_held",
+                    "mode": "execute" if execute else "dry_run",
+                    "registered_dispatches": [],
+                    "reconciled": [],
+                    "resumed": [],
+                    "enrolled_automations": [],
+                    "skipped": [],
+                    "errors": [],
+                }
+            try:
+                return self._supervise_impl(
+                    execute=execute,
+                    now_ts=now_ts,
+                    check_enrolled_automations=check_enrolled_automations,
+                    max_actions=max_actions,
+                )
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    def _supervise_impl(
+        self,
+        *,
+        execute: bool,
+        now_ts: float | None,
+        check_enrolled_automations: bool,
+        max_actions: int | None,
+    ) -> dict[str, Any]:
+        settings = self._settings()
+        current_ts = now_ts if now_ts is not None else time.time()
+        budget = max_actions if max_actions is not None else int(settings.get("max_supervise_actions", 20))
+        actions_taken = 0
+
+        summary: dict[str, Any] = {
+            "status": "completed",
+            "mode": "execute" if execute else "dry_run",
+            "checked_at": _iso_from_ts(current_ts),
+            "registered_dispatches": [],
+            "reconciled": [],
+            "resumed": [],
+            "enrolled_automations": [],
+            "skipped": [],
+            "errors": [],
+        }
+
+        # 1. Register any unrecorded eligible lane_exhausted dispatches
+        dispatches_dir = self.state_dir / "dispatches"
+        if dispatches_dir.is_dir():
+            for path in sorted(dispatches_dir.glob("*.json")):
+                if actions_taken >= budget:
+                    summary["skipped"].append({"source": str(path.name), "reason": "max_supervise_actions_reached"})
+                    continue
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    summary["skipped"].append({"source": path.name, "reason": "corrupt_dispatch_json"})
+                    continue
+                if not isinstance(data, dict) or not HANDOFF_ID_RE.fullmatch(str(data.get("handoff_id") or "")):
+                    summary["skipped"].append({"source": path.name, "reason": "unsafe_or_legacy_dispatch"})
+                    continue
+                handoff_id = data["handoff_id"]
+                if data.get("mode") != "execute" or data.get("status") != "lane_exhausted":
+                    continue
+                if not self._is_unattended_opted_in(data):
+                    summary["skipped"].append({"handoff_id": handoff_id, "reason": "legacy_or_not_opted_in"})
+                    continue
+                canonical_key = f"canonical:dispatch:{handoff_id}"
+                if self._load_by_key(canonical_key) is not None:
+                    continue
+                try:
+                    reg = self.register_dispatch_exhausted(data, execute=execute, now_ts=current_ts)
+                except Exception as error:
+                    summary["errors"].append({"handoff_id": handoff_id, "error": run.redact_text(str(error))[:200]})
+                    continue
+                if reg is None:
+                    summary["skipped"].append({"handoff_id": handoff_id, "reason": "ineligible_or_unsafe_dispatch"})
+                else:
+                    actions_taken += 1
+                    summary["registered_dispatches"].append(
+                        {"handoff_id": handoff_id, "recovery_id": reg["recovery_id"], "status": reg["status"]}
+                    )
+
+        # 2. Reconcile waiting runs & delayed-resume due recoveries
+        if self.recoveries_dir.is_dir():
+            for path in sorted(self.recoveries_dir.glob("*.json")):
+                if not RECOVERY_ID_RE.fullmatch(path.stem):
+                    continue
+                if actions_taken >= budget:
+                    summary["skipped"].append({"recovery_id": path.stem, "reason": "max_supervise_actions_reached"})
+                    continue
+                try:
+                    record = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    summary["skipped"].append({"recovery_id": path.stem, "reason": "corrupt_recovery_json"})
+                    continue
+                if not isinstance(record, dict) or record.get("recovery_id") != path.stem:
+                    summary["skipped"].append({"recovery_id": path.stem, "reason": "invalid_recovery_record"})
+                    continue
+                if record.get("mode") != "execute" or not record.get("idempotency_key"):
+                    summary["skipped"].append({"recovery_id": path.stem, "reason": "not_execute_mode_or_legacy"})
+                    continue
+                if not self._is_unattended_opted_in(record):
+                    summary["skipped"].append({"recovery_id": path.stem, "reason": "legacy_or_not_opted_in"})
+                    continue
+
+                rid = record["recovery_id"]
+                if self._is_reconcilable_record(record):
+                    try:
+                        res = self.reconcile(rid, execute=execute)
+                        actions_taken += 1
+                        summary["reconciled"].append({"recovery_id": rid, "status": res.get("status")})
+                    except Exception as error:
+                        summary["errors"].append({"recovery_id": rid, "error": run.redact_text(str(error))[:200]})
+                    continue
+
+                if record.get("status") in RESUMABLE_DELAYED_STATUSES:
+                    if not self._is_valid_resumable_record(record):
+                        summary["skipped"].append({"recovery_id": rid, "reason": "unsafe_or_legacy_delayed_plan"})
+                        continue
+                    try:
+                        eligible_ts = _parse_iso(record["delayed_resume_plan"]["eligible_at"])
+                    except ValueError:
+                        summary["skipped"].append({"recovery_id": rid, "reason": "invalid_eligible_at"})
+                        continue
+                    if current_ts < eligible_ts:
+                        summary["skipped"].append(
+                            {
+                                "recovery_id": rid,
+                                "reason": "not_yet_eligible",
+                                "eligible_at": record["delayed_resume_plan"]["eligible_at"],
+                            }
+                        )
+                        continue
+                    try:
+                        res = self.resume_after_probe(rid, execute=execute, now_ts=current_ts)
+                        actions_taken += 1
+                        summary["resumed"].append(
+                            {
+                                "recovery_id": rid,
+                                "status": res.get("status"),
+                                "actual_provider": res.get("actual_provider"),
+                            }
+                        )
+                    except Exception as error:
+                        summary["errors"].append({"recovery_id": rid, "error": run.redact_text(str(error))[:200]})
+                    continue
+
+                if record.get("status") not in (
+                    "recovered",
+                    "recovery_run_failed",
+                    "rejected_non_provider",
+                    "failed_non_provider",
+                    "waiting_for_human",
+                ):
+                    summary["skipped"].append(
+                        {
+                            "recovery_id": rid,
+                            "reason": f"status_{record.get('status')}",
+                            **({"block_reason": record["block_reason"]} if record.get("block_reason") else {}),
+                        }
+                    )
+
+        # 3. Check explicitly enrolled automations for settled provider failures
+        if check_enrolled_automations:
+            enrolled = self._load_enrolled_automations()
+            if enrolled:
+                seen_cache = self._load_seen_cache()
+                seen_dirty = False
+                for aid, meta in sorted(enrolled.items()):
+                    if actions_taken >= budget:
+                        summary["skipped"].append({"automation_id": aid, "reason": "max_supervise_actions_reached"})
+                        continue
+                    role = meta.get("role")
+                    lane = meta.get("lane")
+                    if not isinstance(role, str) or not role.strip() or not isinstance(lane, str) or not lane.strip():
+                        summary["skipped"].append({"automation_id": aid, "reason": "invalid_enrollment_metadata"})
+                        continue
+                    try:
+                        auto = self.adapter.automations_show(aid)
+                        if auto.get("enabled") is not True:
+                            summary["skipped"].append({"automation_id": aid, "reason": "automation_not_enabled"})
+                            continue
+                        inspection = self._verify_and_classify(
+                            kind="automation",
+                            role=role,
+                            lane=lane,
+                            bot=None,
+                            chat_id=None,
+                            automation_id=aid,
+                            run_id=None,
+                            dispatch_id=None,
+                            caller_failed_provider=None,
+                            caller_prior_attempted=[],
+                        )
+                    except Exception as error:
+                        summary["errors"].append({"automation_id": aid, "error": run.redact_text(str(error))[:200]})
+                        continue
+
+                    canonical_key = inspection.get("canonical_key")
+                    if not inspection.get("settled"):
+                        summary["skipped"].append(
+                            {"automation_id": aid, "reason": inspection.get("reason", "not_settled")}
+                        )
+                        continue
+                    pre_reason = _run_pre_enrollment_reason(inspection.get("target_run"), meta)
+                    if pre_reason:
+                        summary["skipped"].append({"automation_id": aid, "reason": pre_reason})
+                        continue
+                    if canonical_key and (
+                        self._load_by_key(canonical_key) is not None or canonical_key in seen_cache
+                    ):
+                        continue
+                    classification = inspection.get("classification") or {}
+                    if not classification.get("eligible_for_fallback"):
+                        if execute and canonical_key:
+                            seen_cache[canonical_key] = {
+                                "classification": classification.get("classification"),
+                                "at": _iso_from_ts(current_ts),
+                            }
+                            seen_dirty = True
+                        summary["skipped"].append(
+                            {
+                                "automation_id": aid,
+                                "reason": f"non_provider:{classification.get('classification')}",
+                            }
+                        )
+                        continue
+                    try:
+                        rec_res = self.recover(
+                            kind="automation",
+                            role=role,
+                            lane=lane,
+                            automation_id=aid,
+                            run_id=inspection.get("resolved_run_id"),
+                            execute=execute,
+                        )
+                        actions_taken += 1
+                        summary["enrolled_automations"].append(
+                            {
+                                "automation_id": aid,
+                                "recovery_id": rec_res.get("recovery_id"),
+                                "status": rec_res.get("status"),
+                            }
+                        )
+                    except Exception as error:
+                        summary["errors"].append({"automation_id": aid, "error": run.redact_text(str(error))[:200]})
+                if seen_dirty:
+                    self._save_seen_cache(seen_cache)
+
+        return run.redact_secrets(summary)
 
 
 def main() -> int:
@@ -2209,6 +3308,11 @@ def main() -> int:
     rec.add_argument("--failed-provider")
     rec.add_argument("--prior-attempted", nargs="*", default=[])
     rec.add_argument(
+        "--no-unattended",
+        action="store_true",
+        help="Opt this recovery record out of unattended supervisor execution.",
+    )
+    rec.add_argument(
         "--execute",
         action="store_true",
         help="Perform live recovery mutations (default is read-only dry-run).",
@@ -2227,6 +3331,13 @@ def main() -> int:
     insp = commands.add_parser("inspect", help="Read a persisted recovery record")
     insp.add_argument("--recovery-id", required=True, help="Recovery ID or idempotency key")
 
+    sup_p = commands.add_parser(
+        "supervise", help="Run one bounded reconcile + delayed-resume supervisor pass (dry-run by default)"
+    )
+    sup_p.add_argument("--execute", action="store_true")
+    sup_p.add_argument("--max-actions", type=int)
+    sup_p.add_argument("--skip-automations", action="store_true")
+
     args = parser.parse_args()
     supervisor = RecoverySupervisor()
     try:
@@ -2238,6 +3349,12 @@ def main() -> int:
             result = supervisor.reconcile(args.recovery_id, execute=args.execute)
         elif args.command == "resume":
             result = supervisor.resume_after_probe(args.recovery_id, execute=args.execute)
+        elif args.command == "supervise":
+            result = supervisor.supervise(
+                execute=args.execute,
+                max_actions=args.max_actions,
+                check_enrolled_automations=not args.skip_automations,
+            )
         else:
             result = supervisor.recover(
                 kind=args.kind,
@@ -2257,6 +3374,7 @@ def main() -> int:
                 preferred_provider=args.preferred_provider,
                 failed_provider=args.failed_provider,
                 prior_attempted=args.prior_attempted,
+                unattended=not args.no_unattended,
                 execute=args.execute,
             )
     except Exception as error:

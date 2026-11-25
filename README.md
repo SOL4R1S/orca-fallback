@@ -78,7 +78,53 @@ python3 ~/orca-fallback/dispatch.py \
 Pass `--dry-run` to inspect provider selection and persist a preview without
 launching a worker.
 
-### Recovery supervisor (`recovery.py`)
+When a live `dispatch.py` invocation returns `lane_exhausted` (whether models
+failed with provider errors or all models in the lane were skipped in cooldown),
+it automatically registers a durable recovery record in
+`~/.local/state/orca-fallback/recoveries/` with `supervision_schema_version: 2`,
+`unattended_supervision` opt-in (`true` by default; pass `--no-unattended` to opt
+out), preserved `excluded_providers` (`--skip-provider`), and `attempted_providers`
+containing only actually-attempted models. Models skipped in cooldown remain
+eligible for health-gated delayed resume once their cooldown expires. When every
+non-excluded candidate in a lane actually hit a settled rate-limit/transient
+provider failure proven to have occurred before work or side effects, at most one
+post-cooldown attempt is permitted after an exact `OK` health probe in the same
+lane; credential errors, `model_not_found`, and jobs with tool/worktree side
+effects are never auto-retried and enter an explicit `blocked` state.
+
+### Scoped dispatch wiring (`wiring.py` & `mcp_dispatch.py`)
+
+`wiring.py` defaults to read-only dry-run mode (requiring `--execute` for live
+mutations) and wires **delegated tasks** through supported Orca CLI surfaces:
+
+- **Bot delegation wiring (`install-bot` / `uninstall-bot`)**: Registers the
+  pure-stdlib MCP stdio server (`mcp_dispatch.py`, exposing
+  `orca_fallback_dispatch` and `orca_fallback_status`) per bot via
+  `orca-ide bot tools add` and adds a short, marker-delimited guidance block to
+  that bot's `SOUL.md` (never touching Orca-managed `AGENTS.md`, `CLAUDE.md`, or
+  `bot.json`).
+- **Eligible scheduled automations (`install-automation` / `uninstall-automation`)**:
+  Explicitly enrolls only recurring scheduled automations that pass safety
+  checks (non-`once`, existing local worktree, non-`new-per-run`, non-`reuseSession`,
+  non-recovery), records `enrolled_at` plus `baseline_run_ids` so pre-enrollment
+  runs are never replayed, and wraps a reversible marker-delimited dispatch
+  instruction in the automation prompt via `orca-ide automations edit`. Legacy,
+  one-time, and unenrolled automations are skipped by default.
+- **Deterministic local scheduled dispatch (`install-scheduled-dispatch` / `uninstall-scheduled-dispatch`)**:
+  Installs an opt-in, dry-run-by-default systemd user `.service`/`.timer` pair
+  (`orca-dispatch-<name>.*`) that invokes `dispatch.py` directly on a local
+  worktree without going through an outer LLM prompt.
+
+**Native Orca boundary**: Native Orca bot-chat turns and Orca scheduled
+automations always launch an LLM agent (`--provider` or `--bot` with `--prompt`)
+internally and cannot be externally intercepted before Orca invokes the provider
+(Orca has no command-only automation mode, `--precheck` is only a schedule gate,
+and headless `orca-serve` has no plugin hook service). `SOUL.md` and prompt
+blocks are agent guidance for delegated tasks, not a hard interposer; use
+`install-scheduled-dispatch` for deterministic local worktree schedules, and
+`recovery.py` handles settled provider failures after the fact.
+
+### Recovery supervisor (`recovery.py`) & systemd timer
 
 `recovery.py` defaults to read-only dry-run mode. Live mutations require an
 explicit `--execute` flag.
@@ -96,6 +142,12 @@ python3 ~/orca-fallback/recovery.py recover \
 
 # Reconcile an accepted recovery run against terminal status before marking recovered
 python3 ~/orca-fallback/recovery.py reconcile --recovery-id <id> --execute
+
+# Run one bounded reconcile + delayed-resume supervisor pass (dry-run by default)
+python3 ~/orca-fallback/recovery.py supervise --execute
+
+# Install and enable the oneshot supervisor timer (`units/orca-recovery-supervisor.*`)
+python3 ~/orca-fallback/wiring.py install-systemd --enable --execute
 
 # Run the isolated, loopback-only live E2E harness (creates disposable temp ORCA_USER_DATA_PATH)
 python3 ~/orca-fallback/scripts/e2e_isolated.py
@@ -128,11 +180,20 @@ Key safety guarantees:
 - **Next-task preferred return & delayed health-gated resume**: Active fallback
   tasks never switch mid-task; returning to the preferred provider after a quota
   reset applies to the next task. If all providers in a lane are unavailable, a
-  `delayed_resume_plan` is persisted; `recovery.py resume` only considers unused
-  eligible providers (never looping back to already-attempted models, blocking
-  for a user decision when none remain) and requires a bounded read-only
-  inference probe (`codex exec -s read-only` or `agy --print --sandbox`)
-  returning exact `OK` before starting work.
+  `delayed_resume_plan` is persisted; `recovery.py resume` preserves explicit
+  `excluded_providers` across resume, only considers unused eligible providers
+  first (or at most one post-cooldown attempt when every non-excluded candidate
+  hit a settled rate-limit/transient failure proven to have happened before work
+  or side effects), never auto-retries credentials/`model_not_found`/side-effecting
+  runs, and requires a bounded read-only inference probe (`codex exec -s read-only`
+  or `agy --print --sandbox`) returning exact `OK` in the same lane before
+  starting work.
+- **Opt-in unattended supervision & timer pacing**: `recovery.py supervise` only
+  acts on newly written records carrying `supervision_schema_version: 2` and
+  `unattended_supervision: true` (skipping historical records of the same shape
+  and `--no-unattended` records), and skips enrolled automation runs recorded at
+  or before enrollment. `units/orca-recovery-supervisor.timer` uses
+  `OnUnitInactiveSec=1min` so long supervisor runs do not lose the next tick.
 - **Secret redaction**: API keys, Bearer tokens, Slack/GitHub/Linear tokens, and
   Orca pairing codes are redacted in persisted state and receipts.
 

@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconcile and resume eligible Orca fallback recoveries
+After=orca-serve.service
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=%h/orca-fallback
+ExecStart=/usr/bin/python3 %h/orca-fallback/recovery.py supervise --execute

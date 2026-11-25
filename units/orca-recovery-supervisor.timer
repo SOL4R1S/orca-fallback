@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Orca fallback recovery supervisor periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+AccuracySec=15s
+Persistent=true
+Unit=orca-recovery-supervisor.service
+
+[Install]
+WantedBy=timers.target

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from typing import Any
 from urllib.parse import urlparse
 
@@ -34,6 +35,7 @@ import catalog
 import dispatch
 import recovery
 import run
+import wiring
 
 
 def _free_loopback_port() -> int:
@@ -986,13 +988,223 @@ def run_isolated_e2e() -> dict[str, Any]:
                 "external_connectors": {"slack": None, "linear": None, "github": None},
             }
 
+            # 7. Shared dispatch wiring (bot MCP tool + SOUL.md, eligible scheduled automation, systemd units)
+            temp_systemd_dir = root / "systemd-user"
+            mgr = wiring.WiringManager(
+                adapter=bot_adapter,
+                state_dir=state_dir,
+                repo_root=ROOT,
+                systemd_dir=temp_systemd_dir,
+            )
+            bot_inst = mgr.install_bot(
+                created_bot_id,
+                default_role="implementation",
+                default_lane="economy",
+                execute=True,
+            )
+            assert bot_inst["status"] == "installed", bot_inst
+            assert mgr.install_bot(
+                created_bot_id,
+                default_role="implementation",
+                default_lane="economy",
+                execute=True,
+            )["status"] == "unchanged"
+            bot_tools_now = orca.call("bot", "tools", "--bot", created_bot_id).get("own", [])
+            assert any(t.get("name") == wiring.MCP_TOOL_NAME for t in bot_tools_now), bot_tools_now
+            assert wiring.BOT_MARKER_BEGIN in (bot_dir / "SOUL.md").read_text(encoding="utf-8")
+
+            sched_auto = recovery._unwrap_automation(
+                orca.call(
+                    "automations",
+                    "create",
+                    "--name",
+                    "E2E Eligible Scheduled Job",
+                    "--trigger",
+                    "daily",
+                    "--prompt",
+                    "Read README.md and report worker_done OK.",
+                    "--provider",
+                    "codex",
+                    "--extra-agent-args=--model nonexistent-e2e-model-xyz",
+                    "--workspace",
+                    f"path:{repo}",
+                    "--enabled",
+                )
+            )
+            sched_auto_id = sched_auto["id"]
+            created_auto_ids.append(sched_auto_id)
+
+            wiring_status = mgr.status()
+            ws_by_id = {a["id"]: a for a in wiring_status["automations"]}
+            assert ws_by_id[sched_auto_id]["eligible"] is True, ws_by_id[sched_auto_id]
+            assert ws_by_id[fail_bot_auto_id]["eligible"] is False, ws_by_id[fail_bot_auto_id]
+
+            auto_inst = mgr.install_automation(
+                sched_auto_id,
+                role="implementation",
+                lane="economy",
+                execute=True,
+            )
+            assert auto_inst["status"] == "installed", auto_inst
+            assert mgr.install_automation(
+                sched_auto_id,
+                role="implementation",
+                lane="economy",
+                execute=True,
+            )["status"] == "unchanged"
+
+            # Real stdio subprocess check for mcp_dispatch.py
+            mcp_cfg = json.loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+            mcp_cfg["catalog"] = str(cat_path)
+            mcp_cfg["selection"] = str(sel_path)
+            mcp_cfg["benchmarks"] = str(bench_path)
+            mcp_cfg_path = root / "settings_e2e.json"
+            mcp_cfg_path.write_text(json.dumps(mcp_cfg), encoding="utf-8")
+            mcp_env = env.copy()
+            mcp_env["ORCA_FALLBACK_CONFIG"] = str(mcp_cfg_path)
+            mcp_proc = subprocess.run(
+                [sys.executable, str(ROOT / "mcp_dispatch.py")],
+                input="\n".join(
+                    [
+                        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 3,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "orca_fallback_dispatch",
+                                    "arguments": {
+                                        "worktree": str(repo),
+                                        "title": "E2E MCP Dry Dispatch",
+                                        "role": "implementation",
+                                        "lane": "economy",
+                                        "prompt": "Check README.md",
+                                        "dry_run": True,
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                env=mcp_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=True,
+            )
+            mcp_lines = [json.loads(line) for line in mcp_proc.stdout.strip().splitlines() if line.strip()]
+            assert len(mcp_lines) == 3 and not mcp_lines[2]["result"]["isError"], mcp_lines
+            mcp_disp_out = json.loads(mcp_lines[2]["result"]["content"][0]["text"])
+            assert mcp_disp_out["status"] == "planned_dry_run", mcp_disp_out
+
+            sys_inst = mgr.install_systemd(execute=True)
+            assert sys_inst["status"] == "installed"
+            verify_proc = subprocess.run(
+                [
+                    "systemd-analyze",
+                    "--user",
+                    "verify",
+                    str(temp_systemd_dir / "orca-recovery-supervisor.service"),
+                    str(temp_systemd_dir / "orca-recovery-supervisor.timer"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert verify_proc.returncode == 0, verify_proc.stderr
+
+            # Uninstall bot wiring & systemd & automation cleanly, then re-enroll sched_auto for Scenario 8
+            un_bot = mgr.uninstall_bot(created_bot_id, execute=True)
+            assert un_bot["status"] == "uninstalled"
+            assert (bot_dir / "SOUL.md").read_text(encoding="utf-8") == soul_marker
+            assert orca.call("bot", "tools", "--bot", created_bot_id).get("own", []) == []
+
+            un_auto = mgr.uninstall_automation(sched_auto_id, execute=True)
+            assert un_auto["status"] == "uninstalled"
+            assert bot_adapter.automations_show(sched_auto_id)["prompt"] == "Read README.md and report worker_done OK."
+
+            un_sys = mgr.uninstall_systemd(execute=True)
+            assert un_sys["status"] == "uninstalled"
+
+            report["scenarios"]["shared_dispatch_wiring_and_mcp"] = {
+                "ok": True,
+                "bot_mcp_installed_and_idempotent": True,
+                "bot_soul_reversible": True,
+                "automation_eligibility_and_idempotent": True,
+                "mcp_stdio_dry_dispatch_status": mcp_disp_out["status"],
+                "systemd_units_verified": True,
+            }
+
+            # 8. Automatic supervisor: enrolled automation recovery + dispatch lane_exhausted (all in cooldown) -> delayed resume with real probe
+            # 8a) Enrolled automation fails with provider error -> supervise recovers it
+            run.update_cooldown(state_dir / "cooldowns.json", "codex:nonexistent-e2e-model-xyz", 0)
+            run.update_cooldown(state_dir / "cooldowns.json", "codex:gpt-6-luna", 0)
+            mgr.install_automation(sched_auto_id, role="implementation", lane="economy", execute=True)
+            orca.call("automations", "run", sched_auto_id)
+            _wait_for_automation_terminal_run(orca, sched_auto_id)
+            sup_auto_tick = sup_default.supervise(execute=True)
+            assert len(sup_auto_tick["enrolled_automations"]) == 1, sup_auto_tick
+            assert sup_auto_tick["enrolled_automations"][0]["status"] == "recovered", sup_auto_tick
+            assert bot_adapter.automations_show(sched_auto_id)["enabled"] is False
+
+            # 8b) dispatch.py hits lane_exhausted when all economy models are in cooldown -> durable recovery -> supervise resumes after probe
+            run.update_cooldown(state_dir / "cooldowns.json", "codex:nonexistent-e2e-model-xyz", 300)
+            run.update_cooldown(state_dir / "cooldowns.json", "codex:gpt-6-luna", 60)
+            ex_disp = dispatch.dispatch_task(
+                worktree=repo,
+                spec_file=spec_ok,
+                title="E2E Cooldown Exhausted Dispatch",
+                role="implementation",
+                lane="economy",
+                caller_kind="bot",
+                bot=created_bot_id,
+                orca=orca,
+                state_dir=state_dir,
+            )
+            assert ex_disp["status"] == "lane_exhausted", ex_disp
+            assert ex_disp["actual_provider"] is None, ex_disp
+            assert ex_disp.get("recovery_status") == "exhausted_delayed_resume", ex_disp
+
+            # Immediate tick before cooldown expiry must skip without resuming
+            early_tick = sup_default.supervise(execute=True)
+            assert early_tick["resumed"] == [], early_tick
+
+            # Advance past luna's 60s cooldown -> supervise probes real codex:gpt-6-luna -> runs worker -> recovered!
+            due_tick = sup_default.supervise(execute=True, now_ts=time.time() + 120)
+            assert any(
+                r["recovery_id"] == ex_disp["recovery_id"] and r["status"] == "recovered"
+                for r in due_tick["resumed"]
+            ), due_tick
+            mgr.uninstall_automation(sched_auto_id, execute=True)
+
+            report["scenarios"]["supervisor_auto_reconcile_and_delayed_resume"] = {
+                "ok": True,
+                "enrolled_automation_recovered": sup_auto_tick["enrolled_automations"][0]["recovery_id"],
+                "cooldown_exhausted_dispatch_id": ex_disp["handoff_id"],
+                "durable_recovery_id": ex_disp["recovery_id"],
+                "delayed_resume_status": "recovered",
+            }
+
             # Cleanup automations and disposable bot inside isolated runtime before exit
             for aid in created_auto_ids:
                 try:
                     orca.call("automations", "remove", aid)
                 except Exception:
                     pass
-            rpc_client.rpc("bots.delete", {"botId": created_bot_id})
+            try:
+                rpc_client.rpc("bots.delete", {"botId": created_bot_id})
+            except (BrokenPipeError, OSError, RuntimeError):
+                rpc_client.close()
+                rpc_client = _IsolatedOwnerRpcClient(
+                    pairing_offer["endpoint"],
+                    port,
+                    pairing_offer["publicKeyB64"],
+                    pairing_offer["deviceToken"],
+                )
+                rpc_client.rpc("bots.delete", {"botId": created_bot_id})
             deleted_bot_id = created_bot_id
             created_bot_id = None
             assert orca.call("bot", "list").get("bots", []) == []
@@ -1061,8 +1273,8 @@ def run_isolated_e2e() -> dict[str, Any]:
 def main() -> int:
     try:
         result = run_isolated_e2e()
-    except Exception as error:
-        print(run.redact_text(str(error)), file=sys.stderr)
+    except Exception:
+        print(run.redact_text(traceback.format_exc()), file=sys.stderr)
         return 1
     print(json.dumps(run.redact_secrets(result), indent=2, ensure_ascii=False))
     return 0

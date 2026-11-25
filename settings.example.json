@@ -10,6 +10,9 @@
     "return_to_preferred_on_next_task": true,
     "delayed_resume_delay_seconds": 900,
     "health_probe_timeout_seconds": 30,
+    "max_probe_attempts": 3,
+    "max_resume_attempts": 3,
+    "max_supervise_actions": 20,
     "bots_dir": "~/.orca/bots",
     "once_deadline_seconds": 300
   },
