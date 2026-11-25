@@ -14,7 +14,7 @@ import tempfile
 from typing import Any
 
 from catalog import (
-    CATALOG_PATH, ROOT, SELECTION_PATH, atomic_json, comparison_price, load_json,
+    CATALOG_PATH, ROOT, SELECTION_PATH, atomic_json, comparison_price, load_json, load_selection,
     policy_exclusions, role_lane, selected_entries, set_selected_entries,
 )
 

@@ -197,6 +197,17 @@ Key safety guarantees:
 - **Secret redaction**: API keys, Bearer tokens, Slack/GitHub/Linear tokens, and
   Orca pairing codes are redacted in persisted state and receipts.
 
+### Operations log
+
+Live dispatch and recovery write timestamped text to
+`~/.local/state/orca-fallback/operations.txt`. Follow it with
+`tail -F ~/.local/state/orca-fallback/operations.txt`. Each line records the
+handoff or recovery ID, status, and relevant model or failure classification.
+Prompts, task titles, and raw model output are kept out of this log. Use the ID
+to open the detailed record under `dispatches/` or `recoveries/`. The log rotates
+at 1 MiB and keeps one `operations.previous.txt` file. Both files follow
+`ORCA_FALLBACK_STATE_DIR` when set.
+
 ## Model discovery and selection
 
 `catalog.py` reads OCX's live `/v1/models` catalog and `agy models`. New models

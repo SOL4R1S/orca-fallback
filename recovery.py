@@ -680,6 +680,17 @@ class RecoverySupervisor:
                 sanitized["idempotency_key"],
                 sanitized["recovery_id"],
             )
+            history = sanitized.get("history") or []
+            latest = history[-1] if history else {}
+            plan = sanitized.get("delayed_resume_plan") or {}
+            original = sanitized.get("original_ids") or {}
+            run.log_operation(
+                self.state_dir, "recovery", recovery_id=sanitized["recovery_id"],
+                handoff_id=original.get("handoff_id"), target=sanitized.get("target_kind"),
+                action=latest.get("event"), status=sanitized.get("status"),
+                provider=sanitized.get("actual_provider"), reason=sanitized.get("block_reason"),
+                eligible_at=plan.get("eligible_at"), probe_attempts=plan.get("probe_attempts"),
+            )
         return sanitized
 
     def _record_event(self, record: dict[str, Any], event: str, status: str, detail: Any = None) -> None:
@@ -3044,12 +3055,21 @@ class RecoverySupervisor:
                     "errors": [],
                 }
             try:
-                return self._supervise_impl(
+                summary = self._supervise_impl(
                     execute=execute,
                     now_ts=now_ts,
                     check_enrolled_automations=check_enrolled_automations,
                     max_actions=max_actions,
                 )
+                if execute and summary["errors"]:
+                    run.log_operation(
+                        self.state_dir, "supervisor_errors", count=len(summary["errors"]),
+                        targets=[
+                            {key: value for key, value in entry.items() if key != "error"}
+                            for entry in summary["errors"][:20]
+                        ],
+                    )
+                return summary
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 

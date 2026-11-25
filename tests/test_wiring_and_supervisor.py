@@ -239,6 +239,29 @@ class WiringAndSupervisorTests(unittest.TestCase):
         self.assertEqual(tick3["registered_dispatches"], [])
         self.assertEqual(tick3["resumed"], [])
 
+        log = (self.state_dir / "operations.txt").read_text(encoding="utf-8")
+        for expected in (
+            "dispatch_started", "dispatch_finished", "lane_exhausted", "probe_failed", "recovered",
+            disp["handoff_id"], disp["recovery_id"],
+        ):
+            self.assertIn(expected, log)
+        self.assertNotIn(self.spec_file.read_text(encoding="utf-8").strip(), log)
+        self.assertNotIn("Cooldown skipped dispatch", log)
+
+    def test_operations_log_rotates_and_redacts(self):
+        with mock.patch.object(run, "OPERATIONS_LOG_MAX_BYTES", 140):
+            run.log_operation(self.state_dir, "first", api_key="synthetic-secret")
+            run.log_operation(self.state_dir, "second", status="recovered")
+            run.log_operation(self.state_dir, "third", status="succeeded")
+        current = self.state_dir / "operations.txt"
+        previous = self.state_dir / "operations.previous.txt"
+        self.assertIn("third", current.read_text(encoding="utf-8"))
+        old_log = previous.read_text(encoding="utf-8")
+        self.assertIn("first", old_log)
+        self.assertIn("[REDACTED]", old_log)
+        self.assertNotIn("synthetic-secret", old_log)
+        self.assertEqual(current.stat().st_mode & 0o777, 0o600)
+
     def test_dispatch_all_attempted_failed_and_task_failure_never_escalate_or_replay(self):
         # 1a) All models hit rate_limit/usage_limit BEFORE work -> delayed resume permits ONE post-cooldown attempt -> succeeds
         self.fake_orca.worker_start_queue.extend(

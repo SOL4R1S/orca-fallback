@@ -176,6 +176,11 @@ def dispatch_task(
     if dry_run:
         return run.redact_secrets(record)
 
+    run.log_operation(
+        effective_state_dir, "dispatch_started", handoff_id=handoff_id,
+        caller_kind=caller_kind, role=role, lane=record["lane"],
+        preferred_provider=record["preferred_provider"],
+    )
     job_args = SimpleNamespace(
         worktree=worktree_path,
         spec_file=spec_path,
@@ -210,6 +215,10 @@ def dispatch_task(
             }
         )
         run.write_state(handoff_path, record)
+        run.log_operation(
+            effective_state_dir, "dispatch_blocked", handoff_id=handoff_id,
+            error_type=type(error).__name__,
+        )
         raise
 
     attempts = result.get("attempts", [])
@@ -259,6 +268,18 @@ def dispatch_task(
         }
     )
     run.write_state(handoff_path, record)
+    run.log_operation(
+        effective_state_dir, "dispatch_finished", handoff_id=handoff_id,
+        status=record["status"], provider=actual_provider, job_id=result.get("job_id"),
+        attempts=[
+            {
+                "provider": attempt.get("provider"),
+                "status": attempt.get("status") or attempt.get("worker_state"),
+                "classification": (attempt.get("classification") or {}).get("classification"),
+            }
+            for attempt in attempts
+        ],
+    )
 
     if record["status"] == "lane_exhausted":
         import recovery

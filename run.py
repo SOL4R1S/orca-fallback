@@ -21,6 +21,7 @@ from catalog import SETTINGS, resolve_policy
 
 ROOT = Path(__file__).resolve().parent
 SUPERVISION_SCHEMA_VERSION = 2
+OPERATIONS_LOG_MAX_BYTES = 1024 * 1024
 STATE_DIR = Path(
     os.environ.get(
         "ORCA_FALLBACK_STATE_DIR", Path.home() / ".local" / "state" / "orca-fallback"
@@ -205,6 +206,24 @@ def redact_secrets(value: Any) -> Any:
                 sanitized[key] = redact_secrets(item)
         return sanitized
     return value
+
+
+def log_operation(state_dir: Path, event: str, **fields: Any) -> None:
+    """Append one diagnostic line with a size limit shared by concurrent callers."""
+    path = state_dir / "operations.txt"
+    details = {key: value for key, value in fields.items() if value is not None}
+    line = f"{now()} {event} {json.dumps(redact_secrets(details), ensure_ascii=False)}\n".encode()
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (state_dir / "operations.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if path.exists() and path.stat().st_size + len(line) > OPERATIONS_LOG_MAX_BYTES:
+                path.replace(state_dir / "operations.previous.txt")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "ab") as stream:
+                stream.write(line)
+    except OSError as error:
+        print(f"Could not write operations.txt ({type(error).__name__})", file=sys.stderr)
 
 
 class Orca:
